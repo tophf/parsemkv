@@ -80,14 +80,26 @@ function parseMKV(
         throw $_
         return $null
     }
+
     $script:abort = $false # used for 'stopOn' parameter
 
     initDTD
+
     $header = readRootContainer EBML
-    $segment = if (!$script:abort) { readRootContainer Segment }
+
+    if (!$script:abort) {
+        $segment = readRootContainer Segment
+        if ($segment) {
+            $segment._.header = $header
+        }
+    } else {
+        $segment = $header
+    }
 
     if ([bool]$keepStreamOpen) {
-        $segment._.reader = $bin
+        if ($segment) {
+            $segment._.reader = $bin
+        }
     } else {
         $bin.close()
         $stream.close()
