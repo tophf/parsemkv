@@ -43,6 +43,7 @@ Usage examples:
   }
   $mkv._.reader.close()
   ```
+
 * **Print with filtering**
   ```powershell
   parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0]._.type -eq 'string' }
@@ -53,16 +54,34 @@ Usage examples:
   ```
 
   ```powershell
-  parseMKV 'c:\some\path\file.mkv' -print -printFilter {
-  	param($e)
-  	if ($e._.name -match '^Chap(String|Lang|terTime)') {
-  		for ($atom = $e; $atom -ne $null; $atom = $atom._.parent) {
-  			if ($atom._.name -eq 'ChapterAtom') {
-  				if ($atom.ChapterTimeStart.hours -ge 1) {
-  					$true
-  				}
-  			}
-  		}
-  	}
+  parseMKV 'c:\some\path\file.mkv' -print -printFilter { param($e)
+  	$e._.name -match '^Chap(String|Lang|terTime)' -and $e._.closest('ChapterAtom').ChapterTimeStart.hours -ge 1
+  }
+  ```
+
+* **Finding sub-elements**
+  ```powershell
+  $mkv = parseMKV 'c:\some\path\file.mkv'
+  ```
+
+  ```powershell
+  $DisplayWidth = $mkv._.find('DisplayWidth')
+  $DisplayHeight = $mkv._.find('DisplayHeight')
+  $VideoCodecID = $DisplayWidth._.closest('TrackEntry').CodecID
+  ```
+
+  ```powershell
+  $DisplayWxH = $mkv.Tracks.Video._.find('', '^Display[WH]') -join 'x'
+  ```
+
+  ```powershell
+  ($mkv._.find('ChapterTimeStart') | %{ $_._.displayString }) -join ", "
+  ```
+
+  ```powershell
+  $mkv._.find('ChapterAtom') | %{
+  	'{0:h\:mm\:ss}' -f $_._.find('ChapterTimeStart') +
+  	" - " +
+  	$_._.find('ChapString')
   }
   ```

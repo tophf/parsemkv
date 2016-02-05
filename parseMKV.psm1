@@ -68,17 +68,25 @@
 
     parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0] -is [datetime] }
 
-    parseMKV 'c:\some\path\file.mkv' -print -printFilter {
-        param($e)
-        if ($e._.name -match '^Chap(String|Lang|terTime)') {
-            for ($atom = $e; $atom -ne $null; $atom = $atom._.parent) {
-                if ($atom._.name -eq 'ChapterAtom') {
-                    if ($atom.ChapterTimeStart.hours -ge 1) {
-                        $true
-                    }
-                }
-            }
-        }
+    parseMKV 'c:\some\path\file.mkv' -print -printFilter { param($e)
+        $e._.name -match '^Chap(String|Lang|terTime)' -and $e._.closest('ChapterAtom').ChapterTimeStart.hours -ge 1
+    }
+
+.EXAMPLE
+    $mkv = parseMKV 'c:\some\path\file.mkv'
+
+    $DisplayWidth = $mkv._.find('DisplayWidth')
+    $DisplayHeight = $mkv._.find('DisplayHeight')
+    $VideoCodecID = $DisplayWidth._.closest('TrackEntry').CodecID
+
+    $DisplayWxH = $mkv.Tracks.Video._.find('', '^Display[WH]') -join 'x'
+
+    ($mkv._.find('ChapterTimeStart') | %{ $_._.displayString }) -join ", "
+
+    $mkv._.find('ChapterAtom') | %{
+        '{0:h\:mm\:ss}' -f $_._.find('ChapterTimeStart') +
+        " - " +
+        $_._.find('ChapString')
     }
 #>
 
@@ -103,6 +111,7 @@ function parseMKV(
     $script:abort = $false # used for 'stopOn' parameter
 
     initDTD
+    initMetaBase
 
     $header = readRootContainer EBML
 
@@ -137,6 +146,7 @@ function readRootContainer([string]$requiredID) {
     $container = readEntry
     $container._.level = 0
     $container._.root = $container
+    $container._.ref = $container
 
     if ($container -eq $null -or $container._.type -ne 'container') {
         write-verbose 'Not a container'
@@ -172,6 +182,7 @@ function readChildren([Collections.Specialized.OrderedDictionary]$container) {
         $child._.parent = $container
 
         addNamedChild $container $child._.name $child
+
         if ($entryCallback -and (& $entryCallback $child) -eq 'abort') {
             $script:abort = $true;
             break
@@ -236,12 +247,11 @@ function readEntry {
         }
     }
 
-    $meta = @{
-        id=$id;
-        pos=$pos;
-        size=$size;
-        datapos=$stream.position
-    }
+    $meta = $script:meta.PSObject.copy()
+    $meta.id = $id;
+    $meta.pos = $pos;
+    $meta.size = $size;
+    $meta.datapos = $stream.position
 
     if (!$info) {
         write-warning ("{0,8}: {1,8:x}`tUnknown EBML ID" -f $pos, $id)
@@ -252,10 +262,8 @@ function readEntry {
         return $null
     }
 
-    $meta += @{
-        name=$info.name;
-        type=$info.type
-    }
+    $meta.name = $info.name
+    $meta.type = $info.type
 
     if ($size) {
         switch ($info.type) {
@@ -342,7 +350,8 @@ function cookChildren([Collections.Specialized.OrderedDictionary]$container) {
     function setValue($entry, $newValue) {
         $meta = $entry._
         $raw = $entry.PSObject.copy(); $raw.PSObject.members.remove('_')
-        $entry = add-member _ ($meta + @{rawValue=$raw}) -inputObject $newValue -passthru
+        $meta.rawValue = $raw
+        $entry = add-member _ $meta -inputObject $newValue -passthru
         $entry._.parent[$meta.name] = $entry
         $entry
     }
@@ -468,11 +477,60 @@ function addNamedChild([Collections.Specialized.OrderedDictionary]$dict, [string
     $current = $dict[$key]
     if ($current -eq $null) {
         $dict[$key] = $value
+        $value._.ref = $dict[$key]
     } elseif ($current -is [Collections.ArrayList]) {
         $current.add($value) >$null
+        $value._.ref = $current[-1]
     } else {
         $dict[$key] = [Collections.ArrayList] @($current, $value)
+        $current._.ref = $dict[$key][0]
+        $value._.ref = $dict[$key][1]
     }
+}
+
+function initMetaBase {
+    $script:meta = @{}
+
+    # find the closest parent matching 'name' or 'match' regexp ('name' takes precedence)
+    add-member scriptMethod closest {
+        param([string]$name, [string]$match)
+
+        for ($e = $this.ref; $e -ne $null; $e = $e._.parent) {
+            if (($name -and $e._.name -eq $name) `
+            -or ($match -and $e._.name -match $match)) {
+                return $e
+            }
+        }
+    } -inputObject $meta
+
+    # find all nested children matching 'name' or 'match' regexp ('name' takes precedence)
+    # returns: $null, a single object or a [Collections.ObjectModel.Collection`1]
+    add-member scriptMethod find {
+        param([string]$name, [string]$match)
+
+        $results = {}.invoke()
+        if ($this.type -eq 'container') {
+            $this.ref.getEnumerator().forEach({
+                $child = $_.value
+                if ($child -ne $null) {
+                    $meta = $child._
+                    if (($name -and $meta.name -eq $name) `
+                    -or ($match -and $meta.name -match $match)) {
+                        $results.add($child)
+                    }
+                    if ($meta.type -eq 'container') {
+                        $meta.find($name,$match).forEach({
+                            # skip aliases like Video <-> TrackEntry[0]
+                            if ($results.indexOf($_) -eq -1) {
+                                $results.add($_)
+                            }
+                        })
+                    }
+                }
+            })
+        }
+        $results
+    } -inputObject $meta
 }
 
 function flattenDTD([hashtable]$dict, [bool]$byID, [hashtable]$flat=@{}) {
