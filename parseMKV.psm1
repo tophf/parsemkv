@@ -281,7 +281,7 @@ function readEntry {
                 switch ($size) {
                     4 { $value = [BitConverter]::toSingle($bytes, 0) }
                     8 { $value = [BitConverter]::toDouble($bytes, 0) }
-                    10 { $value = [Nato.LongDouble.BitConverter]::toDouble($bytes, 0) }
+                    10 { $value = decodeLongDouble $bytes }
                 }
             }
             'date' {
@@ -496,85 +496,54 @@ function bin2hex([byte[]]$value) {
     else { '' }
 }
 
-add-type @'
-/* Author:
- *  - Nathan Baulch (nbaulch@bigpond.net.au
- *
- * References:
- *  - http://cch.loria.fr/documentation/IEEE754/numerical_comp_guide/ncg_math.doc.html
- *  - http://groups.google.com/groups?selm=MPG.19a6985d4683f5d398a313%40news.microsoft.com
- */
+function decodeLongDouble([byte[]]$data) {
+    # Converted from C# function
+    # Original author: Nathan Baulch (nbaulch@bigpond.net.au)
+    #   http://www.codeproject.com/Articles/6612/Interpreting-Intel-bit-Long-Double-Byte-Arrays
+    # References:
+    #   http://cch.loria.fr/documentation/IEEE754/numerical_comp_guide/ncg_math.doc.html
+    #   http://groups.google.com/groups?selm=MPG.19a6985d4683f5d398a313%40news.microsoft.com
 
-using System;
-
-namespace Nato.LongDouble
-{
-    public class BitConverter
-    {
-        //converts the next 10 bytes of Value starting at StartIndex into a double
-        public static double ToDouble(byte[] Value,int StartIndex)
-        {
-            if(Value == null)
-                throw new ArgumentNullException("Value");
-
-            if(Value.Length < StartIndex + 10)
-                throw new ArgumentException("Combination of Value length and StartIndex was not large enough.");
-
-            //extract fields
-            byte s = (byte)(Value[9] & 0x80);
-            short e = (short)(((Value[9] & 0x7F) << 8) | Value[8]);
-            byte j = (byte)(Value[7] & 0x80);
-            long f = Value[7] & 0x7F;
-            for(sbyte i = 6; i >= 0; i--)
-            {
-                f <<= 8;
-                f |= Value[i];
-            }
-
-            if(e == 0) //subnormal, pseudo-denormal or zero
-                return 0;
-
-            if(j == 0)
-                throw new NotSupportedException();
-
-            if(e == 0x7FFF) //+infinity, -infinity or nan
-            {
-                if(f != 0)
-                    return double.NaN;
-                if(s == 0)
-                    return double.PositiveInfinity;
-                else
-                    return double.NegativeInfinity;
-            }
-
-            //translate f
-            f >>= 11;
-
-            //translate e
-            e -= (0x3FFF - 0x3FF);
-
-            if(e >= 0x7FF) //outside the range of a double
-                throw new OverflowException();
-            else if(e < -51) //too small to translate into subnormal
-                return 0;
-            else if(e < 0) //too small for normal but big enough to represent as subnormal
-            {
-                f |= 0x10000000000000;
-                f >>= (1 - e);
-                e = 0;
-            }
-
-            byte[] newBytes = System.BitConverter.GetBytes(f);
-
-            newBytes[7] = (byte)(s | (e >> 4));
-            newBytes[6] = (byte)(((e & 0x0F) << 4) | newBytes[6]);
-
-            return System.BitConverter.ToDouble(newBytes,0);
-        }
-
+    if (!$data -or $data.count -lt 10) {
+        return $null
     }
+
+    [int16]$e = ($data[9] -band 0x7F) -shl 8 -bor $data[8]
+    if (!$e) { return 0.0 } # subnormal, pseudo-denormal or zero
+
+    [byte]$j = $data[7] -band 0x80
+    if (!$j) { return $null }
+
+    [int64]$f = $data[7] -band 0x7F
+    for ([sbyte]$i = 6; $i -ge 0; $i--) {
+        $f = $f -shl 8 -bor $data[$i]
+    }
+
+    [byte]$s = $data[9] -band 0x80
+
+    if ($e -eq 0x7FFF) {
+        if ($f) { return [double]::NaN }
+        if (!$s) { return [double]::positiveInfinity }
+        return [double]::negativeInfinity
+    }
+
+    $e -= 0x3FFF - 0x3FF
+    if ($e -ge 0x7FF) { return $null } # outside the range of a double
+    if ($e -lt -51) { return 0.0 } # too small to translate into subnormal
+
+    $f = $f -shr 11
+
+    if ($e -lt 0) { # too small for normal but big enough to represent as subnormal
+        $f = ($f -bor 0x10000000000000) -shr (1 - $e)
+        $e = 0
+    }
+
+    [byte[]]$new = [BitConverter]::getBytes($f)
+    $new[7] = $s -bor ($e -shr 4)
+    $new[6] = (($e -band 0x0F) -shl 4) -bor $new[6]
+
+    [BitConverter]::toDouble($new, 0)
 }
-'@
 
 function initDTD {
     if ($script:DTD) {
