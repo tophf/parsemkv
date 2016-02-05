@@ -29,10 +29,11 @@
 .PARAMETER print
     Pretty-print to the console.
 
-.PARAMETER printMatch
-    Only elements with names matching the provided regexp will be printed.
+.PARAMETER printFilter
+    Only elements with names matching the provided regexp or scriptblock will be printed.
+    Scriptblock receives 'entry' as a parameter and should return a boolean value.
     By default 'SeekHead', 'EBML', 'Void' elements are skipped.
-    Empty = print everything.
+    Empty string = print everything.
 
 .EXAMPLE
     parseMKV 'c:\some\path\file.mkv' -print
@@ -61,6 +62,24 @@
         $file.close()
     }
     $mkv._.reader.close()
+
+.EXAMPLE
+    parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0]._.type -eq 'string' }
+
+    parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0] -is [datetime] }
+
+    parseMKV 'c:\some\path\file.mkv' -print -printFilter {
+        param($e)
+        if ($e._.name -match '^Chap(String|Lang|terTime)') {
+            for ($atom = $e; $atom -ne $null; $atom = $atom._.parent) {
+                if ($atom._.name -eq 'ChapterAtom') {
+                    if ($atom.ChapterTimeStart.hours -ge 1) {
+                        $true
+                    }
+                }
+            }
+        }
+    }
 #>
 
 function parseMKV(
@@ -70,7 +89,7 @@ function parseMKV(
     [scriptblock]$entryCallback,
     [switch]$keepStreamOpen,
     [switch]$print,
-    [string]$printMatch = '^(?!(SeekHead|EBML|Void)$)'
+    $printFilter = '^(?!(SeekHead|EBML|Void)$)' # string or code block
 ) {
     try {
         $file = [IO.File]::open($filepath, [IO.FileMode]::open, [IO.FileAccess]::read, [IO.FileShare]::read)
@@ -405,12 +424,14 @@ function printEntry($entry) {
     $meta = $entry._
     $last = $script:lastPrinted
 
-    if ($printMatch) {
+    if ($printFilter -is [string]) {
         for ($e = $entry; $e -ne $null; $e = $e._.parent) {
-            if (!($e._.name -match $printMatch)) {
+            if (!($e._.name -match $printFilter)) {
                 return
             }
         }
+    } elseif ($printFilter -is [scriptblock] -and !(& $printFilter $entry)) {
+        return
     }
 
     $emptyBinary = $entry._.type -eq 'binary' -and !$entry.length

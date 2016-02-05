@@ -14,11 +14,11 @@ Usage examples:
 * **Print video/audio info**
   ```powershell
   $mkv = parseMKV 'c:\some\path\file.mkv'`
-  $mkv.Tracks.Video | %{ 
+  $mkv.Tracks.Video | %{
   	'Video: {0}x{1}, {2}' -f $_.Video.PixelWidth, $_.Video.PixelHeight, $_.CodecID
   }
   $isMultiAudio = $mkv.Tracks.Audio.Capacity -gt 1
-  $mkv.Tracks.Audio | %{ $index=0 } { 
+  $mkv.Tracks.Audio | %{ $index=0 } {
   	'Audio{0}: {1}{2}' -f (++$index), $_.CodecID, $_.Audio.SamplingFrequency
   }
   ```
@@ -42,4 +42,27 @@ Usage examples:
   	$file.close()
   }
   $mkv._.reader.close()
+  ```
+* **Print with filtering**
+  ```powershell
+  parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0]._.type -eq 'string' }
+  ```
+
+  ```powershell
+  parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0] -is [datetime] }
+  ```
+
+  ```powershell
+  parseMKV 'c:\some\path\file.mkv' -print -printFilter {
+  	param($e)
+  	if ($e._.name -match '^Chap(String|Lang|terTime)') {
+  		for ($atom = $e; $atom -ne $null; $atom = $atom._.parent) {
+  			if ($atom._.name -eq 'ChapterAtom') {
+  				if ($atom.ChapterTimeStart.hours -ge 1) {
+  					$true
+  				}
+  			}
+  		}
+  	}
+  }
   ```
