@@ -110,8 +110,10 @@ function parseMKV(
 
     $script:abort = $false # used for 'stopOn' parameter
 
-    initDTD
-    initMetaBase
+    if (!$script:DTD) {
+        initDTD
+        initMetaBase
+    }
 
     $header = readRootContainer EBML
 
@@ -604,9 +606,6 @@ function decodeLongDouble([byte[]]$data) {
 }
 
 function initDTD {
-    if ($script:DTD) {
-        return
-    }
     $script:DTD = @{
         EBML = @{ id=0x1a45dfa3; type='container'; children = @{
             EBMLVersion = @{ id=0x4286; type='uint'; value=1 };
