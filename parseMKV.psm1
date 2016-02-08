@@ -1,4 +1,7 @@
-﻿<#
+﻿#requires -version 4
+set-strictMode -version 4
+
+<#
 .SYNOPSIS
     Parses an MKV file
 
@@ -12,7 +15,7 @@
     Input file path
 
 .PARAMETER stopOn
-    Stop parsing when a tag ID matches the regex pattern, case-insensitive, specify an empty string to disable
+    Stop parsing when /an/entry/path/ matches the regex pattern, case-insensitive, specify an empty string to disable
 
 .PARAMETER binarySizeLimit
     Do not autoread binary data bigger than this number of bytes, specify -1 for no limit
@@ -46,7 +49,7 @@
     $mkv.Tracks.Audio | %{ $index=0 } { 'Audio{0}: {1}{2}' -f (++$index), $_.CodecID, $_.Audio.SamplingFrequency }
 
 .EXAMPLE
-    $mkv = parseMKV 'c:\some\path\file.mkv' -stopOn 'tracks' -binarySizeLimit 0
+    $mkv = parseMKV 'c:\some\path\file.mkv' -stopOn '/tracks/' -binarySizeLimit 0
 
     $duration = $mkv.Info.Duration
 
@@ -91,76 +94,119 @@
 #>
 
 function parseMKV(
-    [string]$filepath,
-    [string]$stopOn = 'cluster',
-    [int]$binarySizeLimit = 16,
-    [scriptblock]$entryCallback,
-    [switch]$keepStreamOpen,
-    [switch]$print,
-    $printFilter = '^(?!(SeekHead|EBML|Void)$)' # string or code block
+        [string] [parameter(mandatory)] [validateScript({test-path -literal $_})]
+    $filepath,
+
+        [string] [validateScript({'' -match $_ -or $true})]
+    $stopOn,
+
+        [string] [validateScript({'' -match $_ -or $true})]
+    $skip = '^/Segment/(Cluster|Cue)', <# checked only after -stopOn #>
+
+        [string] [validateSet('skip','read-when-printing','read','exhaustive-search')]
+    $tags = 'read-when-printing',
+
+        [int32] [validateRange(-1, [int32]::MaxValue)]
+    $binarySizeLimit = 16,
+
+        [switch]
+    $keepStreamOpen,
+
+        [switch]
+    $print,
+
+        [switch]
+    $printRaw,
+
+        [validateScript({($_ -is [string] -and ('' -match $_ -or $true)) -or $_ -is [scriptblock]})]
+    $printFilter = '^(?!.*?/(SeekHead/|EBML/|Void\b))', <# string/scriptblock #>
+
+        [scriptblock]
+    $entryCallback
 ) {
     try {
-        $file = [IO.File]::open($filepath, [IO.FileMode]::open, [IO.FileAccess]::read, [IO.FileShare]::read)
-        $stream = new-object IO.BufferedStream $file, 32 # otherwise it stupidly reads ahead 4kB every seek(!)
+        $stream = [IO.FileStream]::new(
+            $filepath,
+            [IO.FileMode]::open,
+            [IO.FileAccess]::read,
+            [IO.FileShare]::read,
+            16, # by default read-ahead is 4096 and we don't need that after every seek
+            [IO.FileOptions]::RandomAccess
+        )
         $bin = [IO.BinaryReader] $stream
     } catch {
         throw $_
         return $null
     }
 
-    $script:abort = $false # used for 'stopOn' parameter
-
-    if (!$script:DTD) {
-        initDTD
-        initMetaBase
+    if (!(test-path variable:script:DTD)) {
+        init
+    }
+    $state = @{
+        abort = $false # set when entryCallback returns 'abort'
+        print = @{ tick=[datetime]::now.ticks }
+        timecodeScale = $DTD.__names.TimecodeScale.value
+    }
+    # -printRaw implies -print
+    if ([bool]$printRaw) {
+        $print = $printRaw
+    }
+    # less ambiguous local alias
+    $tagsAction = $tags
+    if ($tags -eq 'skip' -or ($tags -eq 'read-when-printing' -and ![bool]$print)) {
+        $skip += '|/Tags/'
     }
 
-    $header = readRootContainer EBML
+    $header = readRootContainer 'EBML'
 
-    if (!$script:abort) {
-        $segment = readRootContainer Segment
-        if ($segment) {
-            $segment._.header = $header
-        }
+    if (!$state.abort) {
+        $segment = readRootContainer 'Segment'
+        $segment._.header = $header
     } else {
         $segment = $header
     }
 
     if ([bool]$keepStreamOpen) {
-        if ($segment) {
-            $segment._.reader = $bin
-        }
+        $segment._.reader = $bin
     } else {
         $bin.close()
-        $stream.close()
     }
 
-    if ([bool]$print) { write-host '' }
+    if ([bool]$print) {
+        if (!$state.print['omitLineFeed']) {
+            $host.UI.writeLine()
+        }
+        if ($state.print['progress']) {
+            write-progress $state.print.progress -completed
+        }
+    }
 
     $segment
 }
 
 function readRootContainer([string]$requiredID) {
     if ($stream.position -ge $stream.length) {
-        return $null
-    }
-
-    $container = readEntry
-    $container._.level = 0
-    $container._.root = $container
-    $container._.ref = $container
-
-    if ($container -eq $null -or $container._.type -ne 'container') {
-        write-verbose 'Not a container'
-        return $null
-    }
-    if ($requiredID -and $container._.name -ne $requiredID) {
-        write-verbose "Expected $requiredID but got $($container._.name)"
-        return $null
-    }
-    if ($entryCallback -and (& $entryCallback $child) -eq 'abort') {
-        $script:abort = $true;
         return
+    }
+
+    $meta = readEntry @{ _=@{path='/'; level=-1; root=$null} }
+
+    if (!$meta -or !$meta.ref) {
+        throw 'Not a container'
+    }
+
+    $container = $meta.root = $meta.ref
+    $meta.remove('parent')
+
+    if ($meta.type -ne 'container') {
+        throw 'Not a container'
+    }
+    if ($requiredID -and $meta.name -ne $requiredID) {
+        throw "Expected '$requiredID' but got '$($meta.name)'"
+    }
+    if ($entryCallback -and (& $entryCallback $container) -eq 'abort') {
+        $state.abort = $true;
+        return $container
     }
     if ([bool]$print) {
         printEntry $container
@@ -170,128 +216,208 @@ function readRootContainer([string]$requiredID) {
     $container
 }
 
-function readChildren([Collections.Specialized.OrderedDictionary]$container) {
+function readChildren($container) {
     $stream.position = $container._.datapos
     $stopAt = $container._.datapos + $container._.size
 
-    while ($stream.position -lt $stopAt) {
-        $child = readEntry
-        if ($child -eq $null) {
+    while ($stream.position -lt $stopAt -and !$state.abort) {
+
+        $meta = readEntry $container
+        if (!$meta) {
             break
         }
-        $child._.level = $container._.level + 1
-        $child._.root = $container._.root
-        $child._.parent = $container
 
-        addNamedChild $container $child._.name $child
+        $child = $meta.ref
 
         if ($entryCallback -and (& $entryCallback $child) -eq 'abort') {
-            $script:abort = $true;
+            $state.abort = $true
             break
         }
-
-        if ($child._.type -eq 'container') {
+        if ($meta['skipped']) {
+            if (!$state['exhaustiveSearch']) {
+                if ($tagsAction -ne 'skip' -and (locateTagsBlock $child)) {
+                    continue
+                }
+                if ($tagsAction -ne 'exhaustive-search') {
+                    $stream.position = $stopAt
+                    break
+                }
+                $state.exhaustiveSearch = $true
+            }
             if ([bool]$print) {
-                printEntry $child
+                $ms = ([datetime]::now.ticks - $state.print.tick)/10000
+                if ($ms -gt 300) {
+                    $done = $meta.pos / $stream.length
+                    $state.print.progress = "Skipping $($meta.name) elements"
+                    write-progress $state.print.progress `
+                        -percentComplete ($done * 100) `
+                        -secondsRemaining (($ms / $done - $ms) / 1000 + 1)
+                }
             }
+            continue
+        }
+        if ($meta.type -ne 'container') {
+            continue
+        }
+        if (![bool]$print) {
             readChildren $child
-            if ($script:abort) {
-                break
-            }
+            continue
+        }
+        if ([bool]$printRaw) {
+            printEntry $child
+            readChildren $child
+            continue
+        }
+        if ($state.print['postponed']) {
+            readChildren $child
+            continue
+        }
+        if ($meta.path -cmatch $printPostponed) {
+            $state.print.postponed = $true
+            readChildren $child
+            printEntry $child
+            printChildren $child -includeContainers
+            $state.print.postponed = $false
+        } else {
+            printEntry $child
+            readChildren $child
         }
     }
-    cookChildren $container
 
-    if ([bool]$print -and !$script:abort) {
+    if ([bool]$print -and !$state.abort -and !$state.print['postponed']) {
         printChildren $container
     }
 }
 
-function readEntry {
-    # inline the code because PowerShell's overhead for a simple function call
+function readEntry($container) {
+    # inlining because PowerShell's overhead for a simple function call
     # is bigger than the time to execute it
 
-    $pos = $stream.position
-
-    $head = [uint64]$bin.ReadByte()
-    $id = if ($head -eq 0 -or $head -eq 0xFF) {
-        write-warning "BAD ID $head"
-        -1
-    } else {
-        $len = 1; [uint64]$tail = 0;
-        # max value in 4 bytes is (2^28 - 2)
-        for ($mask = 0x80; $head -lt $mask; $mask = $mask -shr 1) {
-            $tail = [uint64]$tail -shl 8 -bor $bin.readByte()
-            $len++
-        }
-        if ($len -le 4) { $head = [int]$head; $tail = [int]$tail }
-        $head -shl (($len-1)*8) -bor $tail
-    }
-
-    $info = $DTD.IDs['{0:x}' -f $id]
-
-    $size = if ($info -and $info.size -ne $null) {
-        $info.size
-    } else {
-        $head = [uint64]$bin.ReadByte()
-        if ($head -eq 0 -or $head -eq 0xFF) {
-            write-warning "BAD SIZE $head"
-            -1
-        } else {
-            $len = 1; [uint64]$tail = 0;
-            # max value in 4 bytes is (2^28 - 2)
-            for ($mask = 0x80; $head -lt $mask; $mask = $mask -shr 1) {
-                $tail = [uint64]$tail -shl 8 -bor $bin.readByte()
-                $len++
+    function bakeTime($value=$value, $meta=$meta, [bool]$ms, [bool]$fps, [switch]$noScaling) {
+        [uint64]$nanoseconds = if ([bool]$noScaling) { $value }
+                               else { $value * $state.timecodeScale }
+        $time = [TimeSpan]::new($nanoseconds / 100)
+        if ($ms) {
+            $fpsstr = if ($fps -and $container['TrackType'] -match '^(1|Video)$') {
+                ', ' + (1000000000 / $value).toString('g5',$numberFormat) + ' fps'
             }
-            if ($len -le 4) { $head = [int]$head; $tail = [int]$tail }
-            ($head -band -bnot [byte]$mask) -shl (($len-1)*8) -bor $tail
+            $meta.displayString = ('{0:0}ms' -f $time.totalMilliseconds) + $fpsstr
+        } else {
+            $meta.displayString = '{0}{1}s ({2:hh\:mm\:ss\.fff})' -f `
+                $time.totalSeconds.toString('n0',$numberFormat),
+                (('.{0:000}' -f $time.milliseconds) -replace '\.000',''),
+                $time
         }
+        $meta.rawValue = $value
+        $time
     }
 
     $meta = $script:meta.PSObject.copy()
-    $meta.id = $id;
-    $meta.pos = $pos;
-    $meta.size = $size;
+    $meta.pos = $stream.position
+
+    $buf = [byte[]]::new(8)
+    $buf[0] = $_ = $bin.readByte()
+    $meta.id = if ($_ -eq 0 -or $_ -eq 0xFF) {
+            write-warning "BAD ID $_"
+            -1
+        } else {
+            $len = 8 - [byte][Math]::floor([Math]::log($_)/[Math]::log(2))
+            if ($len -eq 1) {
+                $_
+            } else {
+                $bin.read($buf, 1, $len - 1) >$null
+                [Array]::reverse($buf, 0, $len)
+                [BitConverter]::ToUInt64($buf, 0)
+            }
+        }
+
+    $info = $DTD.__IDs['{0:x}' -f $meta.id]
+
+    $meta.name = if ($info) { $info.name } else { '?' }
+    $meta.type = if ($info) { $info.type } else { '' }
+    $meta.path = $container._.path + $meta.name + '/'*[int]($meta.type -eq 'container')
+
+    $meta.size = $size = if ($info -and $info.contains('size')) {
+            $info.size
+        } else {
+            $buf.clear()
+            $buf[0] = $_ = $bin.readByte()
+            if ($_ -eq 0 -or $_ -eq 0xFF) {
+                write-warning "BAD SIZE $_"
+                -1
+            } else {
+                $len = 8 - [byte][Math]::floor([Math]::log($_)/[Math]::log(2))
+                $buf[0] = $_ = $_ -band -bnot (1 -shl (8-$len))
+                if ($len -eq 1) {
+                    $_
+                } else {
+                    $bin.read($buf, 1, $len - 1) >$null
+                    [Array]::reverse($buf, 0, $len)
+                    [BitConverter]::ToUInt64($buf, 0)
+                }
+            }
+        }
+
     $meta.datapos = $stream.position
 
     if (!$info) {
-        write-warning ("{0,8}: {1,8:x}`tUnknown EBML ID" -f $pos, $id)
-        return (@{} | add-member _ $meta -passthru)
-    }
-    if ($stopOn -and $info.name -match $stopOn) {
+        write-warning ("{0,8}: {1,8:x}`tUnknown EBML ID" -f $meta.pos, $meta.id)
         $stream.position += $size
+        return $meta
+    }
+
+    if ($stopOn -and $meta.path -match $stopOn) {
+        $stream.position = $meta.pos
         return $null
     }
 
-    $meta.name = $info.name
-    $meta.type = $info.type
+    $meta.level = $container._.level + 1
+    $meta.root = $container._.root
+    $meta.parent = $container
+
+    if ($skip -and $meta.path -match $skip) {
+        $stream.position += $size
+        $meta.ref = [ordered]@{ _=$meta }
+        $meta.skipped = $true
+        return $meta
+    }
 
     if ($size) {
-        switch ($info.type) {
+        switch ($meta.type) {
             'int' {
-                $bytes = $bin.readBytes($size)
-                if ($size -eq 8) {
-                    [Array]::reverse($bytes)
-                    $value = [BitConverter]::toInt64($bytes, 0)
+                if ($size -eq 1) {
+                    $value = $bin.readSByte()
                 } else {
-                    [uint64]$v = 0
-                    foreach ($b in $bytes) { $v = $v -shl 8 -bor $b }
-                    $value = [int64]$v - ([uint64]1 -shl $size*8)
+                    $buf.clear()
+                    $bin.read($buf, 0, $size) >$null
+                    [Array]::reverse($buf, 0, $size)
+                    $value = [BitConverter]::toInt64($buf, 0)
+                    if ($size -lt 8) {
+                        $value -= ([int64]1 -shl $size*8)
+                    }
                 }
             }
             'uint' {
-                $bytes = $bin.readBytes($size)
-                [uint64]$value = 0
-                foreach ($b in $bytes) { $value = $value -shl 8 -bor $b }
+                if ($size -eq 1) {
+                    $value = $bin.readByte()
+                } else {
+                    $buf.clear()
+                    $bin.read($buf, 0, $size) >$null
+                    [Array]::reverse($buf, 0, $size)
+                    $value = [BitConverter]::toUInt64($buf, 0)
+                }
             }
             'float' {
-                $bytes = $bin.readBytes($size)
-                [Array]::reverse($bytes)
+                $buf = $bin.readBytes($size)
+                [Array]::reverse($buf)
                 switch ($size) {
-                    4 { $value = [BitConverter]::toSingle($bytes, 0) }
-                    8 { $value = [BitConverter]::toDouble($bytes, 0) }
-                    10 { $value = decodeLongDouble $bytes }
+                    4 { $value = [BitConverter]::toSingle($buf, 0) }
+                    8 { $value = [BitConverter]::toDouble($buf, 0) }
+                    10 { $value = decodeLongDouble $buf }
+                    default {
+                        write-warning "FLOAT should be 4, 8 or 10 bytes, got $size"
+                        $value = 0.0
+                    }
                 }
             }
             'date' {
@@ -299,9 +425,9 @@ function readEntry {
                     write-warning "DATE should be 8 bytes, got $size"
                     $rawvalue = 0
                 } else {
-                    $bytes = $bin.readBytes(8)
-                    [Array]::reverse($bytes)
-                    $rawvalue = [BitConverter]::toInt64($bytes,0)
+                    $buf = $bin.readBytes(8)
+                    [Array]::reverse($buf)
+                    $rawvalue = [BitConverter]::toInt64($buf,0)
                 }
                 $value = ([datetime]'2001-01-01T00:00:00.000Z').addTicks($rawvalue/100)
             }
@@ -313,8 +439,11 @@ function readEntry {
                             else { [Math]::min($binarySizeLimit,$size) }
                 if ($readSize) {
                     $value = $bin.ReadBytes($readSize)
+                    if ($meta.name -cmatch '\wUID$') {
+                        $meta.displayString = bin2hex $value
+                    }
                 } else {
-                    $value = [byte[]]@()
+                    $value = [byte[]]::new(0)
                 }
             }
             'container' {
@@ -325,7 +454,7 @@ function readEntry {
             }
         }
         $stream.position = $meta.datapos + $size
-    } elseif ($info.value -ne $null) {
+    } elseif ($info.contains('value')) {
         $value = $info.value
     } else {
         switch ($meta.type) {
@@ -343,139 +472,125 @@ function readEntry {
         'uint' { if ($size -le 4) { [uint32] } else { [uint64] } }
         'float' { if ($size -eq 4) { [single] } else { [double] } }
     }
-    # using explicit assignment to keep empty values which are lost in $var=if(...) {val1} else {val2}
+
+    # using explicit assignment to keep empty values that get lost in $var=if(...) {val1} else {val2}
     if ($typecast) { $result = $value -as $typecast } else { $result = $value }
-    add-member _ $meta -inputObject $result -passthru
-}
 
-function cookChildren([Collections.Specialized.OrderedDictionary]$container) {
-    function setValue($entry, $newValue) {
-        $meta = $entry._
-        $raw = $entry.PSObject.copy(); $raw.PSObject.members.remove('_')
-        $meta.rawValue = $raw
-        $entry = add-member _ $meta -inputObject $newValue -passthru
-        $entry._.parent[$meta.name] = $entry
-        $entry
-    }
-    function bakeTime($entry, [switch]$noScaling) {
-        if ($entry -eq $null) {
-            return
+    # cook the values
+    switch -regex ($meta.path) {
+        '/Info/TimecodeScale$' {
+            $state.timecodeScale = $value
+            if ($dur = $container['Duration']) {
+                setEntryValue $dur (bakeTime $dur $dur._)
+            }
         }
-        $nanoseconds = [uint64]$entry
-        if (![bool]$noScaling) {
-            $nanoseconds *= $entry._.root.Info.TimecodeScale # scale is a mandatory element
+        '/Info/Duration$' {
+            if ($container['TimecodeScale']) {
+                $result = bakeTime
+            }
         }
-        $time = new-object TimeSpan ([uint64]$nanoseconds / 100)
-        $entry = setValue $entry $time
-        $seconds = [Math]::round($nanoseconds/1000000000, 3)
-        $entry._.displayString = '{0}s ({1:hh\:mm\:ss\.fff})' -f `
-            $seconds.toString([Globalization.CultureInfo]::InvariantCulture),
-            $time
-        $entry
-    }
-    function bakeUID($UID) {
-        if ($UID) {
-            $UID._.displayString = bin2hex $UID
+        '/(Cluster/Timecode|CuePoint/CueTime)$' {
+            $result = bakeTime
         }
-    }
-    switch ($container._.name) {
-        'Info' {
-            bakeTime $container.Duration >$null
-            bakeUID $container.SegmentUID
+        '/CueTrackPositions/CueDuration$' {
+            $result = bakeTime -ms:$true
         }
-        'ChapterAtom' {
-            'Start', 'End' | %{
-                $time = $container["ChapterTime$_"]
-                if ($time -ne $null) {
-                    $time = setValue $time (new-object TimeSpan ([uint64]$time / 100))
-                    $time._.displayString = '{0:hh\:mm\:ss\.fff}' -f $time
+        '/ChapterAtom/ChapterTime(Start|End)$' {
+            $result = [TimeSpan]::new($value / 100)
+            $meta.displayString = '{0:hh\:mm\:ss\.fff}' -f $result
+        }
+        '/TrackEntry/Default(DecodedField)?Duration$' {
+            $result = bakeTime -ms:$true -fps:$true -noScaling
+        }
+        '/TrackEntry/TrackType$' {
+            if ($typestr = $DTD.__TrackTypes[[int]$result]) {
+                $meta.rawValue = $result
+                $result = $typestr
+                addNamedChild $container._.parent $typestr $container
+            }
+            'DefaultDuration', 'DefaultDecodedFieldDuration' | %{
+                if ($dur = $container[$_]) {
+                    setEntryValue $dur (bakeTime $dur $dur._ -ms:$true -fps:$true -noScaling)
                 }
             }
-            bakeUID $container.ChapterSegmentUID
         }
-        'TrackEntry' {
-            $trackType = switch ($container.TrackType) { # mandatory element
-                1 { 'Video' }
-                2 { 'Audio' }
-                0x10 { 'Logo' }
-                0x11 { 'Subtitle' }
-                0x12 { 'Buttons' }
-                0x20 { 'Control' }
-            }
-            addNamedChild $container._.parent (setValue $container.TrackType $trackType) $container
-            if ($container.DefaultDuration) {
-                $duration = bakeTime $container.DefaultDuration -noScaling
-                if ($trackType -eq 'Video') {
-                    $extraFormat = ', {1} fps'
-                    $fps = [math]::round(1000000000 / $duration._.rawValue, 3)
-                    $fps = $fps.toString([Globalization.CultureInfo]::InvariantCulture)
+    }
+
+    $key = $meta.name
+
+    # this single line consumes up to 50% of the entire processing time
+    $meta.ref = add-member _ $meta -inputObject $result -passthru
+
+    #inlining for speed: addNamedChild $container $key $entry
+    $existing = $container[$key]
+    if ($existing -eq $null) {
+        $meta.ref = $container[$key] = $meta.ref
+    } elseif ($existing -is [Collections.ArrayList]) {
+        $existing.add($meta.ref) >$null
+        $meta.ref = $existing[-1]
+    } else {
+        $container[$key] = [Collections.ArrayList] @($existing, $meta.ref)
+        $existing._.ref = $container[$key][0]
+        $meta.ref = $container[$key][1]
+    }
+    $meta
+}
+
+function locateTagsBlock($current) {
+    $seg = $current._.closest('Segment')
+    [uint64]$end = $seg._.datapos + $seg._.size
+
+    $maxBackSteps = 4096
+    $stepSize = 512
+
+    if ($stream.position + 16*$current._.size + $maxBackSteps*$stepSize -gt $end) {
+        # do nothing if the stream's end is near
+        return
+    }
+    foreach ($step in 1..$maxBackSteps) {
+        $stream.position = $start = $end - $stepSize*$step
+        $buf = $bin.readBytes($stepSize + 8*2) # current code supports max 8-byte id and size
+        $haystack = [BitConverter]::toString($buf)
+
+        # try locating Tags first but in case the last section is
+        # Clusters or Cues assume there's no Tags anywhere and just report success
+        # in order for readChildren to finish its job peacefully
+        foreach ($section in 'Tags','Cluster','Cues') {
+            $idhex = $DTD.__names[$section].id.toString('X')
+            if ($idhex.length -band 1) { $idhex = '0' + $idhex }
+            $idhex = ($idhex -replace '..', '-$0').substring(1)
+            $idlen = ($idhex.length+1)/3
+
+            $idpos = $buf.length
+            while ($idpos -gt 0) {
+                $idpos = $haystack.lastIndexOf($idhex, ($idpos-1)*3) / 3
+                if ($idpos -lt 0) {
+                    break
                 }
-                $duration._.displayString = "{0:0}ms$extraFormat" -f $duration.totalMilliseconds, $fps
+                # try reading 'size'
+                $sizepos = $idpos + $idlen
+                $first = $buf[$sizepos]
+                if ($first -eq 0 -or $first -eq 0xFF -or $sizepos+7 -ge $buf.length) {
+                    break
+                } else {
+                    $sizelen = 8 - [byte][Math]::floor([Math]::log($first)/[Math]::log(2))
+                    $buf[$sizepos] = $first = $first -band -bnot (1 -shl (8-$sizelen))
+                    [Array]::reverse($buf, $sizepos, $sizelen)
+                    foreach ($_ in ($sizepos+$sizelen)..($sizepos+7)) { $buf[$_] = 0 }
+                    $size = [BitConverter]::ToUInt64($buf, $sizepos)
+
+                    if ($start + $sizepos + $sizelen + $size -eq $end) {
+                        $stream.position = $start + $idpos
+                        return $true
+                    }
+                }
             }
         }
-        'Cluster' {
-            bakeTime $container.Timecode >$null # mandatory element
-        }
     }
+    $stream.position = $current._.datapos + $current._.size
 }
 
-function printChildren([Collections.Specialized.OrderedDictionary]$container) {
-    foreach ($child in $container.values) {
-        if ($child._.type -ne 'container') {
-            if ($child -is [Collections.ArrayList]) {
-                $child | %{ printEntry $_ }
-            } else {
-                printEntry $child
-            }
-        }
-    }
-}
-
-function printEntry($entry) {
-    $meta = $entry._
-    $last = $script:lastPrinted
-
-    if ($printFilter -is [string]) {
-        for ($e = $entry; $e -ne $null; $e = $e._.parent) {
-            if (!($e._.name -match $printFilter)) {
-                return
-            }
-        }
-    } elseif ($printFilter -is [scriptblock] -and !(& $printFilter $entry)) {
-        return
-    }
-
-    $emptyBinary = $entry._.type -eq 'binary' -and !$entry.length
-    if ($emptyBinary -and $last -and $last.emptyBinary -and $last.id -eq $meta.id) {
-        $last.skipped++
-        write-host -n .
-        return
-    }
-    if ($last) {
-        if ($last.skipped) { write-host -f darkgray " [$($last.skipped)]" }
-        else { write-host '' }
-    }
-    $script:lastPrinted = @{ id=$meta.id; emptyBinary=$emptyBinary }
-
-    $color = if ($meta.type -eq 'container') { 'white' } else { 'gray' }
-    write-host -n -f $color (('  '*$meta.level) + $meta.name + ' ')
-
-    $s = if ($meta.displayString) {
-        $meta.displayString
-    } elseif ($entry._.type -eq 'binary') {
-        if ($entry.length) {
-            $ellipsis = if ($entry.length -lt $meta.size) { '...' } else { '' }
-            "[$($meta.size) bytes] $((bin2hex $entry) -replace '(.{8})', '$1 ')$ellipsis"
-        }
-    } elseif ($entry._.type -ne 'container') {
-        "$entry"
-    }
-    $color = if ($meta.name -match 'UID$') { 'darkgray' }
-             else { switch ($meta.type) { string { 'green' } binary { 'darkgray' } default { 'yellow' } } }
-    write-host -n -f $color $s
-}
-
-function addNamedChild([Collections.Specialized.OrderedDictionary]$dict, [string]$key, $value) {
+function addNamedChild($dict, [string]$key, $value) {
     $current = $dict[$key]
     if ($current -eq $null) {
         $dict[$key] = $value
@@ -490,65 +605,13 @@ function addNamedChild([Collections.Specialized.OrderedDictionary]$dict, [string
     }
 }
 
-function initMetaBase {
-    $script:meta = @{}
-
-    # find the closest parent matching 'name' or 'match' regexp ('name' takes precedence)
-    add-member scriptMethod closest {
-        param([string]$name, [string]$match)
-
-        for ($e = $this.ref; $e -ne $null; $e = $e._.parent) {
-            if (($name -and $e._.name -eq $name) `
-            -or ($match -and $e._.name -match $match)) {
-                return $e
-            }
-        }
-    } -inputObject $meta
-
-    # find all nested children matching 'name' or 'match' regexp ('name' takes precedence)
-    # returns: $null, a single object or a [Collections.ObjectModel.Collection`1]
-    add-member scriptMethod find {
-        param([string]$name, [string]$match)
-
-        $results = {}.invoke()
-        if ($this.type -eq 'container') {
-            $this.ref.getEnumerator().forEach({
-                $child = $_.value
-                if ($child -ne $null) {
-                    $meta = $child._
-                    if (($name -and $meta.name -eq $name) `
-                    -or ($match -and $meta.name -match $match)) {
-                        $results.add($child)
-                    }
-                    if ($meta.type -eq 'container') {
-                        $meta.find($name,$match).forEach({
-                            # skip aliases like Video <-> TrackEntry[0]
-                            if ($results.indexOf($_) -eq -1) {
-                                $results.add($_)
-                            }
-                        })
-                    }
-                }
-            })
-        }
-        $results
-    } -inputObject $meta
-}
-
-function flattenDTD([hashtable]$dict, [bool]$byID, [hashtable]$flat=@{}) {
-    foreach ($i in $dict.getEnumerator()) {
-        $v = $i.value
-        if ($byID) {
-            $flat['{0:x}' -f $v.id] = $v
-            $v.name = $i.key
-        } else {
-            $flat[$i.key] = $v
-        }
-        if ($v.children) {
-            $flat = flattenDTD $v.children $byID $flat
-        }
-    }
-    $flat
+function setEntryValue($entry, $value) {
+    $meta = $entry._
+    $raw = $entry.PSObject.copy(); $raw.PSObject.members.remove('_')
+    $meta.rawValue = $raw
+    $entry = add-member _ $meta -inputObject $value -passthru
+    $entry._.parent[$meta.name] = $entry
+    $entry
 }
 
 function bin2hex([byte[]]$value) {
@@ -575,7 +638,7 @@ function decodeLongDouble([byte[]]$data) {
     if (!$j) { return $null }
 
     [int64]$f = $data[7] -band 0x7F
-    for ([sbyte]$i = 6; $i -ge 0; $i--) {
+    foreach ($i in 6..0) {
         $f = $f -shl 8 -bor $data[$i]
     }
 
@@ -605,7 +668,381 @@ function decodeLongDouble([byte[]]$data) {
     [BitConverter]::toDouble($new, 0)
 }
 
-function initDTD {
+#####################################################################################################
+
+function printChildren($container, [switch]$includeContainers) {
+    $container.values.forEach({
+        if ($_._.type -eq 'container' -and ![bool]$includeContainers) {
+            return
+        }
+        if ($_ -is [Collections.ArrayList]) {
+            $_.forEach({
+                if (!$_._['printed']) {
+                    printEntry $_
+                    $_._.printed = $true
+                }
+            })
+        } elseif (!$_._['printed']) {
+            printEntry $_
+            $_._.printed = $true
+        }
+    })
+}
+
+function printEntry($entry) {
+
+    function xy2ratio([int]$x, [int]$y) {
+        [int]$a = $x; [int]$b = $y
+        while ($b -gt 0) {
+            [int]$rem = $a % $b
+            $a = $b
+            $b = $rem
+        }
+        "$($x/$a):$($y/$a)"
+    }
+
+    $meta = $entry._
+    if ($meta['skipped']) {
+        return
+    }
+    if ($printFilter -is [string]) {
+        if (!($meta.path -match $printFilter)) {
+            return
+        }
+    } elseif ($printFilter -is [scriptblock]) {
+        if (!(& $printFilter $entry)) {
+            return
+        }
+    }
+
+    $last = $state.print
+    if ($last['progress']) {
+        write-progress $last.progress -completed
+        $last.progress = $null
+    }
+    $emptyBinary = $meta.type -eq 'binary' -and !$entry.length
+    if ($emptyBinary -and $last['emptyBinary'] -and $last['path'] -eq $meta.path) {
+        $last['skipped']++
+        $host.UI.write('.')
+        return
+    }
+    if ($last['path']) {
+        if ($last['skipped']) {
+            $host.UI.writeLine(8,0, " [$($last.skipped)]")
+            $last.skipped = 0
+        } elseif (!$last['omitLineFeed']) {
+            $host.UI.writeLine()
+        } else {
+            $last['omitLineFeed'] = $false
+        }
+    }
+    $last.path = $meta.path
+    $last.tick = [datetime]::now.ticks
+    $last.emptyBinary = $emptyBinary
+
+    if (!$printRaw) {
+      switch -regex ($meta.path) {
+        '/TrackEntry/$' {
+            $type = $entry.TrackType
+            $oneOfKind = $entry._.parent[$type] -isnot [Collections.ArrayList]
+            $flags = if ($entry['FlagForced'] -eq 1) { '!' } else { '' }
+            $flags += @{ d='*'; d0=''; d1='+' }["d$($entry['FlagDefault'])"]
+            $flags += if ($entry['FlagEnabled'] -eq 0) { '-' } else { '' }
+            $host.UI.write('white', 0, ('  '*$entry._.level) +
+                $type + ' ' + ($flags -replace '.$','$0 '))
+            $host.UI.write('gray', 0, $entry.CodecID + ' ')
+            $s = ''
+            $alt = ''
+            switch ($type) {
+                'Video' {
+                    $w = $entry.Video.PixelWidth
+                    $h = $entry.Video.PixelHeight
+                    $i = if ($entry.Video['FlagInterlaced'] -eq 1) { 'i' } else { '' }
+                    $host.UI.write('yellow', 0, "${w}x$h$i ")
+
+                    $dw = $entry.Video['DisplayWidth']; if (!$dw) { $dw = $w }
+                    $dh = $entry.Video['DisplayHeight']; if (!$dh) { $dh = $h }
+                    $DAR = xy2ratio $dw $dh
+                    $SAR = xy2ratio $w $h
+                    if ($SAR -eq $DAR) {
+                        $SAR = ''
+                    } else {
+                        $DARden = $DAR -replace '^.+?:',''
+                        $DAR = "DAR $DAR"
+                        $PAR = xy2ratio ($dw*$h) ($w*$dh)
+                        $SAR = ', orig ' + ($w / $h).toString('g4',$numberFormat) + ", PAR $PAR"
+                    }
+                    $host.UI.write('darkgray', 0, "($DAR or $(($dw/$dh).toString('g4',$numberFormat))$SAR) ")
+
+                    $d = $entry['DefaultDuration']
+                    if (!$d) { $d = $entry['DefaultDecodedFieldDuration'] }
+                    $fps = if ($d) { ($d._.displayString -replace '^.+?, ', '') + ' ' } else { '' }
+                    $host.UI.write('yellow', 0, $fps)
+                }
+                'Audio' {
+                    $ch = $entry._.find('Channels')
+                    if ($ch) { $s += "${ch}ch " }
+
+                    $hz = $entry._.find('SamplingFrequency')
+                    $hzOut = $entry._.find('OutputSamplingFrequency'); if (!$hzOut) { $hzOut = $hz }
+                    if ($hzOut) { $s += ($hzOut/1000).toString($numberFormat) + 'kHz ' }
+                    if ($hzOut -and $hzOut -ne $hz) { $s += '(SBR) ' }
+                    $bits = $entry._.find('BitDepth')
+                    if ($bits) { $s += "${bits}bit " }
+                    $host.UI.write('yellow', 0, $s)
+                }
+            }
+            $lng = "$($entry['Language'])" -replace 'und',''
+            if (!$lng) { $lng = $DTD.__names.TrackEntry.children.Language.value }
+            $name = $entry['Name']
+            if ($lng) {
+                if ($name) { $lng += '/' }
+                $host.UI.write('darkgray', 0, $lng)
+            }
+            if ($name) {
+                $host.UI.write('green', 0, $name + ' ')
+            }
+            return
+        }
+        '/ChapterAtom/$' {
+            $enabled = if ($entry['ChapterFlagEnabled'] -ne 0) { 1 } else { 0 }
+            $hidden = if ($entry['ChapterFlagHidden'] -eq 1) { 1 } else { 0 }
+            $flags = if ($enabled) { '' } else { '!' }
+            $flags += if ($hidden) { '-' } else { '' }
+            $color = (1-$enabled) + 2*$hidden
+            $host.UI.write(@('white','gray','darkgray')[$color], 0, ('  '*$entry._.level) + 'Chapter ')
+            $host.UI.write(@('gray','gray','darkgray')[$color], 0, $entry.ChapterTimeStart._.displayString + ' ')
+            $host.UI.write('darkgray', 0, ($flags -replace '.$', '$0 '))
+            $entry['ChapterDisplay'] | %{ $i = 0 } {
+                if ($i -gt 0) {
+                    $host.UI.write('darkgray', 0, ' ')
+                }
+                $lng = $_['ChapLanguage']; if (!$lng) { $lng = $DTD.__names.ChapLanguage.value }
+                if ($lng -and $lng -ne 'und') {
+                    $host.UI.write('darkgray', 0, $lng + '/')
+                }
+                if ($_['ChapString']) {
+                    $host.UI.write(@('green','gray','darkgray')[$color], 0, $_.ChapString)
+                }
+                $i++
+            }
+            return
+        }
+        '/EditionEntry/EditionFlag(Hidden|Default)$' {
+            if ($entry -ne 1) {
+                $last.omitLineFeed = $true
+                return
+            }
+        }
+        '/AttachedFile/FileName$' {
+            $att = $meta.parent
+            $host.UI.write('white', 0, ('  '*$att._.level) + 'AttachedFile ')
+            $host.UI.write('green', 0, $entry + ' ')
+            $host.UI.write('darkgray', 0, '['+$att.FileData._.size + ' bytes] ')
+            $host.UI.write('darkgreen', 0, $att['FileDescription'])
+            return
+        }
+        '/Tag/$' {
+            $tracks = $meta.closest('Segment').Tracks.TrackEntry
+            if ($tracks -isnot [Collections.ArrayList]) { $tracks = @($tracks) }
+            $host.UI.write('white', 0, ('  '*$meta.level) + 'Tags ')
+
+            $targets = if ($entry.Targets -is [Collections.ArrayList]) { $entry.Targets } else { @($entry.Targets) }
+            $targets = $targets | %{ $comma = '' } {
+                $UID = $_.TagTrackUID
+                $track = $tracks.where({ $_.TrackUID -eq $UID }, 'first')
+                if ($track) {
+                    $track = $track[0]
+                    $host.UI.write('gray', 0, $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
+                    if ($track['Name']) {
+                        $host.UI.write('cyan', 0, ' (' + $track.Name + ')')
+                    }
+                }
+                $comma = ', '
+            }
+
+            $host.UI.writeLine()
+            $statsDelim = '  '*($entry._.level+1)
+
+            $simpletags = if ($entry.SimpleTag -is [Collections.ArrayList]) { $entry.SimpleTag }
+                          else { @($entry.SimpleTag) }
+            foreach ($stag in $simpletags) {
+                if ($stag.TagName.startsWith('_STATISTICS_')) {
+                    continue
+                }
+                $stats = switch ($stag.TagName) {
+                    'BPS' {
+                        ($stag.TagString / 1000).toString('n0', $numberFormat); $alt = ' kbps' }
+                    'DURATION' {
+                        $stag.TagString -replace '.{6}$',''; $alt = '' }
+                    'NUMBER_OF_FRAMES' {
+                        ([uint64]$stag.TagString).toString('n0', $numberFormat); $alt = ' frames' }
+                    'NUMBER_OF_BYTES' {
+                        [uint64]$size = $stag.TagString
+                        [uint64]$base = 0x10000000000
+                        $alt = ''
+                        @('TiB','GiB','MiB','KiB').where({
+                            if ($size / $base -lt 1) {
+                                $base = $base -shr 10
+                            } else {
+                                $alt = ($size / $base).toString('g3', $numberFormat) + ' ' + $_
+                                $true
+                            }
+                        }, 'first') >$null
+                        $s = $size.toString('n0', $numberFormat) + ' bytes'
+                        if ($alt) { $alt; $alt = " ($s)" }
+                        else { $s }
+                    }
+                }
+                if ($stats) {
+                    $host.UI.write('darkgray', 0, $statsDelim)
+                    $host.UI.write(@('yellow','gray')[[int]!$alt], 0, $stats)
+                    $host.UI.write('darkgray', 0, $alt)
+                    $statsDelim = ', '
+                    continue
+                }
+                $default = if ($stag['TagDefault'] -eq 1) { '*' } else { '' }
+                $flags = $default + $stag.TagLanguage
+                $host.UI.write('gray', 0, ('  '*$stag._.level) + $stag.TagName + ($flags -replace '^\*eng$',': '))
+                if ($flags -ne '*eng') {
+                    $host.UI.write('darkgray', 0, '/' + $flags + ': ')
+                }
+                if ($stag.contains('TagString')) {
+                    $host.UI.write('darkcyan', 0, $stag.TagString)
+                } elseif ($stag.contains('TagBinary')) {
+                    $tb = $stag.TagBinary
+                    if ($tb.length) {
+                        $ellipsis = if ($tb.length -lt $tb._.size) { '...' } else { '' }
+                        $host.UI.write('darkgray', 0, "[$($tb._.size) bytes] ")
+                        $host.UI.write('darkgreen', 0, ((bin2hex $tb) -replace '(.{8})', '$1 ') + $ellipsis)
+                    }
+                }
+                $host.UI.writeLine()
+            }
+            $host.UI.writeLine()
+            return
+        }
+        '/Info/(DateUTC|(Muxing|Writing)App)$' {
+            if ($meta.parent.MuxingApp -eq 'no_variable_data') {
+                $last.omitLineFeed = $true
+                return
+            }
+        }
+        $printPretty {
+            $last.omitLineFeed = $true
+            return
+        }
+        '^/Segment/\w+/$' {
+            $host.UI.writeLine()
+        }
+      }
+    }
+
+    $color = if ($meta.type -eq 'container') { 'white' } else { 'gray' }
+    $host.UI.write($color, 0, ('  '*$meta.level) + $meta.name + ' ')
+
+    $s = if ($meta.contains('displayString')) {
+        $meta.displayString
+    } elseif ($meta.type -eq 'binary') {
+        if ($entry.length) {
+            $ellipsis = if ($entry.length -lt $meta.size) { '...' } else { '' }
+            "[$($meta.size) bytes] $((bin2hex $entry) -replace '(.{8})', '$1 ')$ellipsis"
+        }
+    } elseif ($meta.type -ne 'container') {
+        "$entry"
+    }
+    $color = if ($meta.name -match 'UID$') { 'darkgray' }
+             else { switch ($meta.type) { string { 'green' } binary { 'darkgray' } default { 'yellow' } } }
+    $host.UI.write($color, 0, $s)
+}
+
+#####################################################################################################
+
+function init {
+
+    function flattenDTD([hashtable]$dict, [bool]$byID, [hashtable]$flat=@{}) {
+        $dict.getEnumerator().forEach({
+            $v = $_.value
+            if ($byID) {
+                $flat['{0:x}' -f $v.id] = $v
+                $v.name = $_.key
+            } else {
+                $flat[$_.key] = $v
+            }
+            if ($v.contains('children')) {
+                $flat = flattenDTD $v.children $byID $flat
+            }
+        })
+        $flat
+    }
+
+    # postpone printing these small sections until all contained info is known
+    $script:printPostponed = '/(Tracks|ChapterAtom|Tag)/$'
+    $script:printPretty = `
+        '/Segment/$|' +
+        '/Info/(TimecodeScale|SegmentUID)$|' +
+        '/Tracks/TrackEntry/(|' +
+            'Video/(|(Pixel|Display)(Width|Height)|FlagInterlaced)|' +
+            'Audio/(|(Output)?SamplingFrequency|Channels|BitDepth)|' +
+            'Track(Number|UID|Type)|Codec(ID|Private)|Language|Name|DefaultDuration|MinCache|' +
+            'Flag(Lacing|Default|Forced|Enabled)|CodecDecodeAll|MaxBlockAdditionID|TrackTimecodeScale' +
+        ')$|' +
+        '/Chapters/EditionEntry/(' +
+            'EditionUID|' +
+            'ChapterAtom/(|' +
+                'Chapter(' +
+                    'Display/(|Chap(String|Language|Country))|' +
+                    'UID|Time(Start|End)|Flag(Hidden|Enabled)' +
+                ')' +
+            ')' +
+        ')$|' +
+        '/Attachments/AttachedFile/|' +
+        '/Tags/Tag/'
+    $script:numberFormat = [Globalization.CultureInfo]::InvariantCulture
+
+    $script:meta = @{}
+
+    add-member scriptMethod closest { param([string]$name, [string]$match)
+        # find the closest parent matching 'name' or 'match' regexp ('name' takes precedence)
+        $e = $this.ref
+        do {
+            if (($name -and $e._.name -eq $name) `
+            -or ($match -and $e._.name -match $match)) {
+                return $e
+            }
+            $e = $e._['parent']
+        } until ($e -eq $null)
+    } -inputObject $meta
+
+    add-member scriptMethod find { param([string]$name, [string]$match)
+        # find all nested children matching 'name' or 'match' regexp ('name' takes precedence)
+        # returns: $null, a single object or a [Collections.ObjectModel.Collection`1]
+        $results = {}.invoke()
+        if ($this.type -ne 'container') {
+            return $results
+        }
+        $this.ref.getEnumerator().forEach({
+            $child = $_.value
+            if ($child -eq $null) {
+                return
+            }
+            $meta = $child._
+            if (($name -and $meta.name -eq $name) `
+            -or ($match -and $meta.name -match $match)) {
+                $results.add($child)
+            }
+            if ($meta.type -eq 'container') {
+                $meta.find($name,$match).forEach({
+                    # skip aliases like Video <-> TrackEntry[0]
+                    if ($results.indexOf($_) -eq -1) {
+                        $results.add($_)
+                    }
+                })
+            }
+        })
+        $results
+    } -inputObject $meta
+
     $script:DTD = @{
         EBML = @{ id=0x1a45dfa3; type='container'; children = @{
             EBMLVersion = @{ id=0x4286; type='uint'; value=1 };
@@ -712,7 +1149,7 @@ function initDTD {
                     TrackOffset = @{ id=0x537f; type='int'; value=0 };
                     MaxBlockAdditionID = @{ id=0x55ee; type='uint'; value=0 };
                     Name = @{ id=0x536e; type='string' };
-                    Language = @{ id=0x22b59c; type='string'; value="eng" };
+                    Language = @{ id=0x22b59c; type='string'; value='eng' };
                     CodecID = @{ id=0x86; type='string' };
                     CodecPrivate = @{ id=0x63a2; type='binary' };
                     CodecName = @{ id=0x258688; type='string' };
@@ -845,7 +1282,7 @@ function initDTD {
                     EditionFlagOrdered = @{ id=0x45dd; type='uint' };
                     ChapterAtom = @{ id=0xb6; type='container'; children = @{
                         ChapterUID = @{ id=0x73c4; type='uint' };
-                        ChapterStringUID = @{ id=0x5654; type='8' };
+                        ChapterStringUID = @{ id=0x5654; type='binary' };
                         ChapterTimeStart = @{ id=0x91; type='uint' };
                         ChapterTimeEnd = @{ id=0x92; type='uint' };
                         ChapterFlagHidden = @{ id=0x98; type='uint'; value=0 };
@@ -878,7 +1315,7 @@ function initDTD {
                 Tag = @{ id=0x7373; type='container'; children = @{
                     Targets = @{ id=0x63c0; type='container'; children = @{
                         TargetTypeValue = @{ id=0x68ca; type='uint' };
-                        TargetType = @{ id=0x63ca; type='s' };
+                        TargetType = @{ id=0x63ca; type='string' };
                         TagTrackUID = @{ id=0x63c5; type='uint'; value=0 };
                         TagEditionUID = @{ id=0x63c9; type='uint' };
                         TagChapterUID = @{ id=0x63c4; type='uint'; value=0 };
@@ -886,7 +1323,7 @@ function initDTD {
                     }};
                     SimpleTag = @{ id=0x67c8; type='container'; children = @{
                         TagName = @{ id=0x45a3; type='string' };
-                        TagLanguage = @{ id=0x447a; type='s' };
+                        TagLanguage = @{ id=0x447a; type='string' };
                         TagDefault = @{ id=0x4484; type='uint' };
                         TagString = @{ id=0x4487; type='string' };
                         TagBinary = @{ id=0x4485; type='binary' };
@@ -896,7 +1333,19 @@ function initDTD {
         }}
     }
 
-    $script:DTD += @{names=(flattenDTD $DTD); IDs=(flattenDTD $DTD -byID:$true)}
+    $names = flattenDTD $DTD
+    $IDs=flattenDTD $DTD -byID:$true
+
+    $DTD.__names = $names
+    $DTD.__IDs = $IDs
+    $DTD.__trackTypes = @{
+        1='Video'
+        2='Audio'
+        0x10='Logo'
+        0x11='Subtitle'
+        0x12='Buttons'
+        0x20='Control'
+    }
 }
 
 export-moduleMember -function parseMKV
