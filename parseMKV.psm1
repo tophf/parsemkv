@@ -386,146 +386,149 @@ function readEntry($container) {
         return $meta
     }
 
-    if ($size) {
-        switch ($meta.type) {
-            'int' {
-                if ($size -eq 1) {
-                    $value = $bin.readSByte()
-                } else {
-                    $buf.clear()
-                    $bin.read($buf, 0, $size) >$null
-                    [Array]::reverse($buf, 0, $size)
-                    $value = [BitConverter]::toInt64($buf, 0)
-                    if ($size -lt 8) {
-                        $value -= ([int64]1 -shl $size*8)
-                    }
-                }
-            }
-            'uint' {
-                if ($size -eq 1) {
-                    $value = $bin.readByte()
-                } else {
-                    $buf.clear()
-                    $bin.read($buf, 0, $size) >$null
-                    [Array]::reverse($buf, 0, $size)
-                    $value = [BitConverter]::toUInt64($buf, 0)
-                }
-            }
-            'float' {
-                $buf = $bin.readBytes($size)
-                [Array]::reverse($buf)
-                switch ($size) {
-                    4 { $value = [BitConverter]::toSingle($buf, 0) }
-                    8 { $value = [BitConverter]::toDouble($buf, 0) }
-                    10 { $value = decodeLongDouble $buf }
-                    default {
-                        write-warning "FLOAT should be 4, 8 or 10 bytes, got $size"
-                        $value = 0.0
-                    }
-                }
-            }
-            'date' {
-                if ($size -ne 8) {
-                    write-warning "DATE should be 8 bytes, got $size"
-                    $rawvalue = 0
-                } else {
-                    $buf = $bin.readBytes(8)
-                    [Array]::reverse($buf)
-                    $rawvalue = [BitConverter]::toInt64($buf,0)
-                }
-                $value = ([datetime]'2001-01-01T00:00:00.000Z').addTicks($rawvalue/100)
-            }
-            'string' {
-                $value = [Text.Encoding]::UTF8.getString($bin.readBytes($size))
-            }
-            'binary' {
-                $readSize = if ($opt.binarySizeLimit -lt 0) { $size }
-                            else { [Math]::min($opt.binarySizeLimit,$size) }
-                if ($readSize) {
-                    $value = $bin.ReadBytes($readSize)
-                    if ($meta.name -cmatch '\wUID$') {
-                        $meta.displayString = bin2hex $value
-                    }
-                } else {
-                    $value = [byte[]]::new(0)
-                }
-            }
-            'container' {
-                $value = [ordered]@{}
-            }
-            default {
-                $value = @{}
-            }
-        }
-        $stream.position = $meta.datapos + $size
-    } elseif ($info.contains('value')) {
-        $value = $info.value
+    if ($meta.type -ceq 'container') {
+        $meta.ref = $result = $dummyContainer.PSObject.copy()
+        $result._ = $meta
     } else {
-        switch ($meta.type) {
-            'int'       { $value = 0 }
-            'uint'      { $value = 0 }
-            'float'     { $value = 0.0 }
-            'string'    { $value = '' }
-            'container' { $value = [ordered]@{} }
-            default     { $value = @{} }
-        }
-    }
-
-    $typecast = switch ($info.type) {
-        'int'  { if ($size -le 4) { [int32] } else { [int64] } }
-        'uint' { if ($size -le 4) { [uint32] } else { [uint64] } }
-        'float' { if ($size -eq 4) { [single] } else { [double] } }
-    }
-
-    # using explicit assignment to keep empty values that get lost in $var=if(...) {val1} else {val2}
-    if ($typecast) { $result = $value -as $typecast } else { $result = $value }
-
-    # cook the values
-    switch -regex ($meta.path) {
-        '/Info/TimecodeScale$' {
-            $state.timecodeScale = $value
-            if ($dur = $container['Duration']) {
-                setEntryValue $dur (bakeTime $dur $dur._)
+        if ($size) {
+            switch ($meta.type) {
+                'int' {
+                    if ($size -eq 1) {
+                        $value = $bin.readSByte()
+                    } else {
+                        $buf.clear()
+                        $bin.read($buf, 0, $size) >$null
+                        [Array]::reverse($buf, 0, $size)
+                        $value = [BitConverter]::toInt64($buf, 0)
+                        if ($size -lt 8) {
+                            $value -= ([int64]1 -shl $size*8)
+                        }
+                    }
+                }
+                'uint' {
+                    if ($size -eq 1) {
+                        $value = $bin.readByte()
+                    } else {
+                        $buf.clear()
+                        $bin.read($buf, 0, $size) >$null
+                        [Array]::reverse($buf, 0, $size)
+                        $value = [BitConverter]::toUInt64($buf, 0)
+                    }
+                }
+                'float' {
+                    $buf = $bin.readBytes($size)
+                    [Array]::reverse($buf)
+                    switch ($size) {
+                        4 { $value = [BitConverter]::toSingle($buf, 0) }
+                        8 { $value = [BitConverter]::toDouble($buf, 0) }
+                        10 { $value = decodeLongDouble $buf }
+                        default {
+                            write-warning "FLOAT should be 4, 8 or 10 bytes, got $size"
+                            $value = 0.0
+                        }
+                    }
+                }
+                'date' {
+                    if ($size -ne 8) {
+                        write-warning "DATE should be 8 bytes, got $size"
+                        $rawvalue = 0
+                    } else {
+                        $buf = $bin.readBytes(8)
+                        [Array]::reverse($buf)
+                        $rawvalue = [BitConverter]::toInt64($buf,0)
+                    }
+                    $value = ([datetime]'2001-01-01T00:00:00.000Z').addTicks($rawvalue/100)
+                }
+                'string' {
+                    $value = [Text.Encoding]::UTF8.getString($bin.readBytes($size))
+                }
+                'binary' {
+                    $readSize = if ($opt.binarySizeLimit -lt 0) { $size }
+                                else { [Math]::min($opt.binarySizeLimit,$size) }
+                    if ($readSize) {
+                        $value = $bin.ReadBytes($readSize)
+                        if ($meta.name -cmatch '\wUID$') {
+                            $meta.displayString = bin2hex $value
+                        }
+                    } else {
+                        $value = [byte[]]::new(0)
+                    }
+                }
+                'container' {
+                    $result = $value = [ordered]@{}
+                }
+                default {
+                    $value = @{}
+                }
+            }
+        } elseif ($info.contains('value')) {
+            $value = $info.value
+        } else {
+            switch ($meta.type) {
+                'int'       { $value = 0 }
+                'uint'      { $value = 0 }
+                'float'     { $value = 0.0 }
+                'string'    { $value = '' }
+                'container' { $value = [ordered]@{} }
+                default     { $value = @{} }
             }
         }
-        '/Info/Duration$' {
-            if ($container['TimecodeScale']) {
+
+        $typecast = switch ($info.type) {
+            'int'  { if ($size -le 4) { [int32] } else { [int64] } }
+            'uint' { if ($size -le 4) { [uint32] } else { [uint64] } }
+            'float' { if ($size -eq 4) { [single] } else { [double] } }
+        }
+
+        # using explicit assignment to keep empty values that get lost in $var=if(...) {val1} else {val2}
+        if ($typecast) { $result = $value -as $typecast } else { $result = $value }
+
+        # cook the values
+        switch -regex ($meta.path) {
+            '/Info/TimecodeScale$' {
+                $state.timecodeScale = $value
+                if ($dur = $container['Duration']) {
+                    setEntryValue $dur (bakeTime $dur $dur._)
+                }
+            }
+            '/Info/Duration$' {
+                if ($container['TimecodeScale']) {
+                    $result = bakeTime
+                }
+            }
+            '/(Cluster/Timecode|CuePoint/CueTime)$' {
                 $result = bakeTime
             }
-        }
-        '/(Cluster/Timecode|CuePoint/CueTime)$' {
-            $result = bakeTime
-        }
-        '/CueTrackPositions/CueDuration$' {
-            $result = bakeTime -ms:$true
-        }
-        '/ChapterAtom/ChapterTime(Start|End)$' {
-            $result = [TimeSpan]::new($value / 100)
-            $meta.displayString = '{0:hh\:mm\:ss\.fff}' -f $result
-        }
-        '/TrackEntry/Default(DecodedField)?Duration$' {
-            $result = bakeTime -ms:$true -fps:$true -noScaling
-        }
-        '/TrackEntry/TrackType$' {
-            if ($typestr = $DTD.__TrackTypes[[int]$result]) {
-                $meta.rawValue = $result
-                $result = $typestr
-                addNamedChild $container._.parent $typestr $container
+            '/CueTrackPositions/CueDuration$' {
+                $result = bakeTime -ms:$true
             }
-            'DefaultDuration', 'DefaultDecodedFieldDuration' | %{
-                if ($dur = $container[$_]) {
-                    setEntryValue $dur (bakeTime $dur $dur._ -ms:$true -fps:$true -noScaling)
+            '/ChapterAtom/ChapterTime(Start|End)$' {
+                $result = [TimeSpan]::new($value / 100)
+                $meta.displayString = '{0:hh\:mm\:ss\.fff}' -f $result
+            }
+            '/TrackEntry/Default(DecodedField)?Duration$' {
+                $result = bakeTime -ms:$true -fps:$true -noScaling
+            }
+            '/TrackEntry/TrackType$' {
+                if ($typestr = $DTD.__TrackTypes[[int]$result]) {
+                    $meta.rawValue = $result
+                    $result = $typestr
+                    addNamedChild $container._.parent $typestr $container
+                }
+                'DefaultDuration', 'DefaultDecodedFieldDuration' | %{
+                    if ($dur = $container[$_]) {
+                        setEntryValue $dur (bakeTime $dur $dur._ -ms:$true -fps:$true -noScaling)
+                    }
                 }
             }
         }
+        # this single line consumes up to 50% of the entire processing time
+        $meta.ref = add-member _ $meta -inputObject $result -passthru
     }
-
-    $key = $meta.name
-
-    # this single line consumes up to 50% of the entire processing time
-    $meta.ref = add-member _ $meta -inputObject $result -passthru
+    $stream.position = $meta.datapos + $size
 
     #inlining for speed: addNamedChild $container $key $entry
+    $key = $meta.name
     $existing = $container[$key]
     if ($existing -eq $null) {
         $container[$key] = $meta.ref
@@ -1056,6 +1059,8 @@ function init {
         })
         $results
     } -inputObject $meta
+
+    $script:dummyContainer = add-member _ $meta -inputObject (@{}) -passthru
 
     $script:colors = @{
         bold = 'white'
