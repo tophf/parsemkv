@@ -495,9 +495,7 @@ function readEntry($container) {
                 }
             }
             '/Info/Duration$' {
-                if ($container['TimecodeScale']) {
-                    $result = bakeTime
-                }
+                $result = bakeTime
             }
             '/(Cluster/Timecode|CuePoint/CueTime)$' {
                 $result = bakeTime
