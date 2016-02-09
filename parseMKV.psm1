@@ -527,14 +527,11 @@ function readEntry($container) {
     #inlining for speed: addNamedChild $container $key $entry
     $existing = $container[$key]
     if ($existing -eq $null) {
-        $meta.ref = $container[$key] = $meta.ref
+        $container[$key] = $meta.ref
     } elseif ($existing -is [Collections.ArrayList]) {
         $existing.add($meta.ref) >$null
-        $meta.ref = $existing[-1]
     } else {
         $container[$key] = [Collections.ArrayList] @($existing, $meta.ref)
-        $existing._.ref = $container[$key][0]
-        $meta.ref = $container[$key][1]
     }
     $meta
 }
@@ -597,14 +594,10 @@ function addNamedChild($dict, [string]$key, $value) {
     $current = $dict[$key]
     if ($current -eq $null) {
         $dict[$key] = $value
-        $value._.ref = $dict[$key]
     } elseif ($current -is [Collections.ArrayList]) {
         $current.add($value) >$null
-        $value._.ref = $current[-1]
     } else {
         $dict[$key] = [Collections.ArrayList] @($current, $value)
-        $current._.ref = $dict[$key][0]
-        $value._.ref = $dict[$key][1]
     }
 }
 
