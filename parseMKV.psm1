@@ -866,17 +866,23 @@ function printEntry($entry) {
             }
             return
         }
-        '/EditionEntry/EditionFlag(Hidden|Default)$' {
-            if ($entry -ne 1) {
-                $last.omitLineFeed = $true
-                return
+        '/EditionEntry/$' {
+            $flags = 'Ordered','Default','Hidden' | %{
+                @('',$_.toLower())[[int]($entry["EditionFlag$_"] -eq 1)]
             }
+            $host.UI.write($colors.container, 0, ('  '*$meta.level) + 'Edition ')
+            if (($flags -join '')) {
+                $host.UI.write($colors.value, 0, $flags)
+            }
+            return
         }
         '/AttachedFile/FileName$' {
             $att = $meta.parent
             $host.UI.write($colors.container, 0, ('  '*$att._.level) + 'AttachedFile ')
             $host.UI.write($colors.string, 0, $entry + ' ')
-            $host.UI.write($colors.dim, 0, '['+$att.FileData._.size + ' bytes] ')
+            $s, $alt = prettySize $att.FileData._.size
+            $host.UI.write($colors[@('value','dim')[[int]!$alt]], 0, $s)
+            $host.UI.write($colors.dim, 0, $alt)
             $host.UI.write($colors.stringdim, 0, $att['FileDescription'])
             return
         }
@@ -1006,7 +1012,7 @@ function init {
     }
 
     # postpone printing these small sections until all contained info is known
-    $script:printPostponed = '/(Tracks|ChapterAtom|Tag)/$'
+    $script:printPostponed = '/(Info|Tracks|ChapterAtom|Tag|EditionEntry)/$'
     $script:printPretty = `
         '/Segment/$|' +
         '/Info/(TimecodeScale|SegmentUID)$|' +
@@ -1017,7 +1023,7 @@ function init {
             'Flag(Lacing|Default|Forced|Enabled)|CodecDecodeAll|MaxBlockAdditionID|TrackTimecodeScale' +
         ')$|' +
         '/Chapters/EditionEntry/(' +
-            'EditionUID|' +
+            'EditionUID|EditionFlag(Hidden|Default|Ordered)|' +
             'ChapterAtom/(|' +
                 'Chapter(' +
                     'Display/(|Chap(String|Language|Country))|' +
