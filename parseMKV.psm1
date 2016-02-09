@@ -211,13 +211,13 @@ function readRootContainer([string]$requiredID) {
     if (!$meta -or !$meta.ref -or $meta.type -ne 'container') {
         throw 'Not a container'
     }
+    if ($requiredID -and $meta.name -ne $requiredID) {
+        throw "Expected '$requiredID' but got '$($meta.name)'"
+    }
 
     $container = $meta.root = $meta.ref
     $meta.remove('parent')
 
-    if ($requiredID -and $meta.name -ne $requiredID) {
-        throw "Expected '$requiredID' but got '$($meta.name)'"
-    }
     if ($opt.entryCallback -and (& $opt.entryCallback $container) -eq 'abort') {
         $state.abort = $true;
         return $container
