@@ -547,6 +547,12 @@ function locateTagsBlock($current) {
         # do nothing if the stream's end is near
         return
     }
+    $IDs = 'Tags','Cluster','Cues' | %{
+        $IDhex = $DTD.__names[$_].id.toString('X')
+        if ($IDhex.length -band 1) { $IDhex = '0' + $IDhex }
+        ($IDhex -replace '..', '-$0').substring(1)
+    }
+
     foreach ($step in 1..$maxBackSteps) {
         $stream.position = $start = $end - $stepSize*$step
         $buf = $bin.readBytes($stepSize + 8*2) # current code supports max 8-byte id and size
@@ -555,15 +561,11 @@ function locateTagsBlock($current) {
         # try locating Tags first but in case the last section is
         # Clusters or Cues assume there's no Tags anywhere and just report success
         # in order for readChildren to finish its job peacefully
-        foreach ($section in 'Tags','Cluster','Cues') {
-            $idhex = $DTD.__names[$section].id.toString('X')
-            if ($idhex.length -band 1) { $idhex = '0' + $idhex }
-            $idhex = ($idhex -replace '..', '-$0').substring(1)
-            $idlen = ($idhex.length+1)/3
-
+        foreach ($IDhex in $IDs) {
+            $idlen = ($IDhex.length+1)/3
             $idpos = $buf.length
             while ($idpos -gt 0) {
-                $idpos = $haystack.lastIndexOf($idhex, ($idpos-1)*3) / 3
+                $idpos = $haystack.lastIndexOf($IDhex, ($idpos-1)*3) / 3
                 if ($idpos -lt 0) {
                     break
                 }
