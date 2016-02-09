@@ -499,7 +499,7 @@ function readEntry($container) {
             '/(Cluster/Timecode|CuePoint/CueTime)$' {
                 $result = bakeTime
             }
-            '/CueTrackPositions/CueDuration$' {
+            '/(CueTrackPositions/CueDuration|BlockGroup/BlockDuration)$' {
                 $result = bakeTime -ms:$true
             }
             '/ChapterAtom/ChapterTime(Start|End)$' {
