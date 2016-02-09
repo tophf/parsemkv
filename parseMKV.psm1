@@ -756,17 +756,18 @@ function printEntry($entry) {
             $flags = if ($entry['FlagForced'] -eq 1) { '!' } else { '' }
             $flags += @{ d='*'; d0=''; d1='+' }["d$($entry['FlagDefault'])"]
             $flags += if ($entry['FlagEnabled'] -eq 0) { '-' } else { '' }
-            $host.UI.write('white', 0, ('  '*$entry._.level) +
+
+            $host.UI.write($colors.container, 0, ('  '*$entry._.level) +
                 $type + ' ' + ($flags -replace '.$','$0 '))
-            $host.UI.write('gray', 0, $entry.CodecID + ' ')
-            $s = ''
-            $alt = ''
+            $host.UI.write($colors.normal, 0, $entry.CodecID + ' ')
+
+            $s = $alt = ''
             switch ($type) {
                 'Video' {
                     $w = $entry.Video.PixelWidth
                     $h = $entry.Video.PixelHeight
                     $i = if ($entry.Video['FlagInterlaced'] -eq 1) { 'i' } else { '' }
-                    $host.UI.write('yellow', 0, "${w}x$h$i ")
+                    $host.UI.write($colors.value, 0, "${w}x$h$i ")
 
                     $dw = $entry.Video['DisplayWidth']; if (!$dw) { $dw = $w }
                     $dh = $entry.Video['DisplayHeight']; if (!$dh) { $dh = $h }
@@ -780,12 +781,12 @@ function printEntry($entry) {
                         $PAR = xy2ratio ($dw*$h) ($w*$dh)
                         $SAR = ', orig ' + ($w / $h).toString('g4',$numberFormat) + ", PAR $PAR"
                     }
-                    $host.UI.write('darkgray', 0, "($DAR or $(($dw/$dh).toString('g4',$numberFormat))$SAR) ")
+                    $host.UI.write($colors.dim, 0, "($DAR or $(($dw/$dh).toString('g4',$numberFormat))$SAR) ")
 
                     $d = $entry['DefaultDuration']
                     if (!$d) { $d = $entry['DefaultDecodedFieldDuration'] }
                     $fps = if ($d) { ($d._.displayString -replace '^.+?, ', '') + ' ' } else { '' }
-                    $host.UI.write('yellow', 0, $fps)
+                    $host.UI.write($colors.value, 0, $fps)
                 }
                 'Audio' {
                     $ch = $entry._.find('Channels')
@@ -797,18 +798,18 @@ function printEntry($entry) {
                     if ($hzOut -and $hzOut -ne $hz) { $s += '(SBR) ' }
                     $bits = $entry._.find('BitDepth')
                     if ($bits) { $s += "${bits}bit " }
-                    $host.UI.write('yellow', 0, $s)
+                    $host.UI.write($colors.value, 0, $s)
                 }
             }
             $lng = "$($entry['Language'])" -replace 'und',''
             if (!$lng) { $lng = $DTD.__names.TrackEntry.children.Language.value }
             $name = $entry['Name']
             if ($lng) {
-                if ($name) { $lng += '/' }
-                $host.UI.write('darkgray', 0, $lng)
+                $host.UI.write($colors.bold, 0, $lng)
+                if ($name) { $host.UI.write($colors.dim, 0, '/') }
             }
             if ($name) {
-                $host.UI.write('green', 0, $name + ' ')
+                $host.UI.write($colors.string, 0, $name + ' ')
             }
             return
         }
@@ -818,19 +819,22 @@ function printEntry($entry) {
             $flags = if ($enabled) { '' } else { '!' }
             $flags += if ($hidden) { '-' } else { '' }
             $color = (1-$enabled) + 2*$hidden
-            $host.UI.write(@('white','gray','darkgray')[$color], 0, ('  '*$entry._.level) + 'Chapter ')
-            $host.UI.write(@('gray','gray','darkgray')[$color], 0, $entry.ChapterTimeStart._.displayString + ' ')
-            $host.UI.write('darkgray', 0, ($flags -replace '.$', '$0 '))
+            $host.UI.write($colors[@('container','normal','dim')[$color]], 0,
+                ('  '*$entry._.level) + 'Chapter ')
+            $host.UI.write($colors[@('normal','normal','dim')[$color]], 0,
+                $entry.ChapterTimeStart._.displayString + ' ')
+            $host.UI.write($colors.dim, 0,
+                ($flags -replace '.$', '$0 '))
             $entry['ChapterDisplay'] | %{ $i = 0 } {
                 if ($i -gt 0) {
-                    $host.UI.write('darkgray', 0, ' ')
+                    $host.UI.write($colors.dim, 0, ' ')
                 }
                 $lng = $_['ChapLanguage']; if (!$lng) { $lng = $DTD.__names.ChapLanguage.value }
                 if ($lng -and $lng -ne 'und') {
-                    $host.UI.write('darkgray', 0, $lng + '/')
+                    $host.UI.write($colors.dim, 0, $lng + '/')
                 }
                 if ($_['ChapString']) {
-                    $host.UI.write(@('green','gray','darkgray')[$color], 0, $_.ChapString)
+                    $host.UI.write($colors[@('string','normal','dim')[$color]], 0, $_.ChapString)
                 }
                 $i++
             }
@@ -844,16 +848,16 @@ function printEntry($entry) {
         }
         '/AttachedFile/FileName$' {
             $att = $meta.parent
-            $host.UI.write('white', 0, ('  '*$att._.level) + 'AttachedFile ')
-            $host.UI.write('green', 0, $entry + ' ')
-            $host.UI.write('darkgray', 0, '['+$att.FileData._.size + ' bytes] ')
-            $host.UI.write('darkgreen', 0, $att['FileDescription'])
+            $host.UI.write($colors.container, 0, ('  '*$att._.level) + 'AttachedFile ')
+            $host.UI.write($colors.string, 0, $entry + ' ')
+            $host.UI.write($colors.dim, 0, '['+$att.FileData._.size + ' bytes] ')
+            $host.UI.write($colors.stringdim, 0, $att['FileDescription'])
             return
         }
         '/Tag/$' {
             $tracks = $meta.closest('Segment').Tracks.TrackEntry
             if ($tracks -isnot [Collections.ArrayList]) { $tracks = @($tracks) }
-            $host.UI.write('white', 0, ('  '*$meta.level) + 'Tags ')
+            $host.UI.write($colors.container, 0, ('  '*$meta.level) + 'Tags ')
 
             $targets = if ($entry.Targets -is [Collections.ArrayList]) { $entry.Targets } else { @($entry.Targets) }
             $targets = $targets | %{ $comma = '' } {
@@ -861,9 +865,9 @@ function printEntry($entry) {
                 $track = $tracks.where({ $_.TrackUID -eq $UID }, 'first')
                 if ($track) {
                     $track = $track[0]
-                    $host.UI.write('gray', 0, $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
+                    $host.UI.write($colors.normal, 0, $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
                     if ($track['Name']) {
-                        $host.UI.write('cyan', 0, ' (' + $track.Name + ')')
+                        $host.UI.write($colors.reference, 0, ' (' + $track.Name + ')')
                     }
                 }
                 $comma = ', '
@@ -903,26 +907,28 @@ function printEntry($entry) {
                     }
                 }
                 if ($stats) {
-                    $host.UI.write('darkgray', 0, $statsDelim)
-                    $host.UI.write(@('yellow','gray')[[int]!$alt], 0, $stats)
-                    $host.UI.write('darkgray', 0, $alt)
+                    $host.UI.write($colors.dim, 0, $statsDelim)
+                    $host.UI.write($colors[@('value','normal')[[int]!$alt]], 0, $stats)
+                    $host.UI.write($colors.dim, 0, $alt)
                     $statsDelim = ', '
                     continue
                 }
                 $default = if ($stag['TagDefault'] -eq 1) { '*' } else { '' }
                 $flags = $default + $stag.TagLanguage
-                $host.UI.write('gray', 0, ('  '*$stag._.level) + $stag.TagName + ($flags -replace '^\*eng$',': '))
+                $host.UI.write($colors.normal, 0,
+                    ('  '*$stag._.level) + $stag.TagName + ($flags -replace '^\*eng$',': '))
                 if ($flags -ne '*eng') {
-                    $host.UI.write('darkgray', 0, '/' + $flags + ': ')
+                    $host.UI.write($colors.dim, 0, '/' + $flags + ': ')
                 }
                 if ($stag.contains('TagString')) {
-                    $host.UI.write('darkcyan', 0, $stag.TagString)
+                    $host.UI.write($colors.stringdim2, 0, $stag.TagString)
                 } elseif ($stag.contains('TagBinary')) {
                     $tb = $stag.TagBinary
                     if ($tb.length) {
                         $ellipsis = if ($tb.length -lt $tb._.size) { '...' } else { '' }
-                        $host.UI.write('darkgray', 0, "[$($tb._.size) bytes] ")
-                        $host.UI.write('darkgreen', 0, ((bin2hex $tb) -replace '(.{8})', '$1 ') + $ellipsis)
+                        $host.UI.write($colors.dim, 0, "[$($tb._.size) bytes] ")
+                        $host.UI.write($colors.stringdim2, 0,
+                            ((bin2hex $tb) -replace '(.{8})', '$1 ') + $ellipsis)
                     }
                 }
                 $host.UI.writeLine()
@@ -946,8 +952,8 @@ function printEntry($entry) {
       }
     }
 
-    $color = if ($meta.type -eq 'container') { 'white' } else { 'gray' }
-    $host.UI.write($color, 0, ('  '*$meta.level) + $meta.name + ' ')
+    $color = if ($meta.type -eq 'container') { 'container' } else { 'normal' }
+    $host.UI.write($colors[$color], 0, ('  '*$meta.level) + $meta.name + ' ')
 
     $s = if ($meta.contains('displayString')) {
         $meta.displayString
@@ -959,9 +965,9 @@ function printEntry($entry) {
     } elseif ($meta.type -ne 'container') {
         "$entry"
     }
-    $color = if ($meta.name -match 'UID$') { 'darkgray' }
-             else { switch ($meta.type) { string { 'green' } binary { 'darkgray' } default { 'yellow' } } }
-    $host.UI.write($color, 0, $s)
+    $color = if ($meta.name -match 'UID$') { 'dim' }
+             else { switch ($meta.type) { string { 'string' } binary { 'dim' } default { 'value' } } }
+    $host.UI.write($colors[$color], 0, $s)
 }
 
 #endregion
@@ -1051,6 +1057,20 @@ function init {
         })
         $results
     } -inputObject $meta
+
+    $script:colors = @{
+        bold = 'white'
+        normal = 'gray'
+        dim = 'darkgray'
+
+        container = 'white'
+        string = 'green'
+        stringdim = 'darkgreen'
+        stringdim2 = 'darkcyan' # custom simple tag
+        value = 'yellow'
+
+        reference = 'cyan' # referenced track name in Tags
+    }
 
     $script:DTD = @{
         EBML = @{ id=0x1a45dfa3; type='container'; children = @{
