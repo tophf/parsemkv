@@ -200,6 +200,8 @@ function parseMKV(
     $segment
 }
 
+#region MAIN
+
 function readRootContainer([string]$requiredID) {
     if ($stream.position -ge $stream.length) {
         return
@@ -592,6 +594,9 @@ function locateTagsBlock($current) {
     $stream.position = $current._.datapos + $current._.size
 }
 
+#endregion
+#region UTILITIES
+
 function addNamedChild($dict, [string]$key, $value) {
     $current = $dict[$key]
     if ($current -eq $null) {
@@ -666,7 +671,8 @@ function decodeLongDouble([byte[]]$data) {
     [BitConverter]::toDouble($new, 0)
 }
 
-#####################################################################################################
+#endregion
+#region PRINT
 
 function printChildren($container, [switch]$includeContainers) {
     $printed = @{}
@@ -958,7 +964,8 @@ function printEntry($entry) {
     $host.UI.write($color, 0, $s)
 }
 
-#####################################################################################################
+#endregion
+#region INIT
 
 function init {
 
@@ -1349,5 +1356,6 @@ function init {
         0x20='Control'
     }
 }
+#endregion
 
 export-moduleMember -function parseMKV
