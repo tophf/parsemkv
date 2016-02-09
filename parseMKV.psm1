@@ -778,10 +778,9 @@ function printEntry($entry) {
       switch -regex ($meta.path) {
         '/TrackEntry/$' {
             $type = $entry.TrackType
-            $oneOfKind = $entry._.parent[$type] -isnot [Collections.ArrayList]
             $flags = if ($entry['FlagForced'] -eq 1) { '!' } else { '' }
-            $flags += @{ d='*'; d0=''; d1='+' }["d$($entry['FlagDefault'])"]
-            $flags += if ($entry['FlagEnabled'] -eq 0) { '-' } else { '' }
+            $flags += if ($entry['FlagDefault'] -eq 1) { '*' }
+            $flags += if ($entry['FlagEnabled'] -eq 0) { '-' }
 
             $host.UI.write($colors.container, 0, ('  '*$entry._.level) +
                 $type + ' ' + ($flags -replace '.$','$0 '))
@@ -842,8 +841,8 @@ function printEntry($entry) {
         '/ChapterAtom/$' {
             $enabled = if ($entry['ChapterFlagEnabled'] -ne 0) { 1 } else { 0 }
             $hidden = if ($entry['ChapterFlagHidden'] -eq 1) { 1 } else { 0 }
-            $flags = if ($enabled) { '' } else { '!' }
-            $flags += if ($hidden) { '-' } else { '' }
+            $flags = if ($enabled) { '' } else { '?' }
+            $flags += if ($hidden) { '-' }
             $color = (1-$enabled) + 2*$hidden
             $host.UI.write($colors[@('container','normal','dim')[$color]], 0,
                 ('  '*$entry._.level) + 'Chapter ')
