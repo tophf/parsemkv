@@ -551,11 +551,14 @@ function locateTagsBlock($current) {
         # do nothing if the stream's end is near
         return
     }
-    $IDs = 'Tags','Cluster','Cues' | %{
+    $vint = [byte[]]::new(8)
+    $IDs = 'Tags','SeekPosition','Cluster','Cues' | %{
         $IDhex = $DTD.__names[$_].id.toString('X')
         if ($IDhex.length -band 1) { $IDhex = '0' + $IDhex }
         ($IDhex -replace '..', '-$0').substring(1)
     }
+    # some [old?] mkvs have a zero-sized Cluster with SeekPosition at the end
+    $IDs[1] = $IDs[2] + '-' + $IDs[1]
 
     foreach ($step in 1..$maxBackSteps) {
         $stream.position = $start = $end - $stepSize*$step
@@ -576,15 +579,20 @@ function locateTagsBlock($current) {
                 # try reading 'size'
                 $sizepos = $idpos + $idlen
                 $first = $buf[$sizepos]
-                if ($first -eq 0 -or $first -eq 0xFF -or $sizepos+7 -ge $buf.length) {
+                if ($first -eq 0 -or $first -eq 0xFF) {
                     break
                 } else {
                     $sizelen = 8 - [byte][Math]::floor([Math]::log($first)/[Math]::log(2))
-                    $buf[$sizepos] = $first = $first -band -bnot (1 -shl (8-$sizelen))
-                    [Array]::reverse($buf, $sizepos, $sizelen)
-                    foreach ($_ in ($sizepos+$sizelen)..($sizepos+7)) { $buf[$_] = 0 }
-                    $size = [BitConverter]::ToUInt64($buf, $sizepos)
-
+                    $first = $first -band -bnot (1 -shl (8-$sizelen))
+                    $size = if ($sizelen -eq 1) {
+                            $first
+                        } else {
+                            $vint.clear()
+                            $vint[0] = $first
+                            [Buffer]::BlockCopy($buf, $sizepos+1, $vint, 1, $sizelen-1)
+                            [Array]::reverse($vint, 0, $sizelen)
+                            [BitConverter]::ToUInt64($vint, 0)
+                        }
                     if ($start + $sizepos + $sizelen + $size -eq $end) {
                         $stream.position = $start + $idpos
                         return $true
