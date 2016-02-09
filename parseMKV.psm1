@@ -1,4 +1,4 @@
-﻿#requires -version 4
+#requires -version 4
 set-strictMode -version 4
 
 <#
@@ -23,7 +23,7 @@ set-strictMode -version 4
 
 .PARAMETER entryCallback
     Code block to be called on each entry.
-    Some time/date/tracktype values may be yet raw numbers because processing is 
+    Some time/date/tracktype values may yet be raw numbers because processing is
     guaranteed to occur only after all child elements of a container are read.
     Parameters: entry (with its metadata in _ property).
     Return value: 'abort' to stop all processing, otherwise ignored.
@@ -47,27 +47,31 @@ set-strictMode -version 4
 .EXAMPLE
     $mkv = parseMKV 'c:\some\path\file.mkv'`
 
-    $mkv.Tracks.Video | %{ 'Video: {0}x{1}, {2}' -f $_.Video.PixelWidth, $_.Video.PixelHeight, $_.CodecID }
-    $isMultiAudio = $mkv.Tracks.Audio.Capacity -gt 1
-    $mkv.Tracks.Audio | %{ $index=0 } { 'Audio{0}: {1}{2}' -f (++$index), $_.CodecID, $_.Audio.SamplingFrequency }
+    $mkv.Segment.Tracks.Video | %{
+        'Video: {0}x{1}, {2}' -f $_.Video.PixelWidth, $_.Video.PixelHeight, $_.CodecID
+    }
+    $mkv.Segment.Tracks.Audio | %{ $index=0 } {
+        'Audio{0}: {1} {2}Hz' -f (++$index), $_.CodecID, $_.Audio.SamplingFrequency
+    }
+    $audioTracksCount = $mkv.Segment.Tracks.Audio.count
 
 .EXAMPLE
     $mkv = parseMKV 'c:\some\path\file.mkv' -stopOn '/tracks/' -binarySizeLimit 0
 
-    $duration = $mkv.Info.Duration
+    $duration = $mkv.Segment.Info.Duration
+    $duration = $mkv.Segment[0].Info[0].Duration
 
 .EXAMPLE
     $mkv = parseMKV 'c:\some\path\file.mkv' -keepStreamOpen -binarySizeLimit 0
 
-    $mkv.Attachments.AttachedFile | %{
-        $file = [IO.File]::create($_.FileName)
-        $size = $_.FileData._.size
-        $mkv._.reader.baseStream.position = $_.FileData._.datapos
-        $data = $mkv._.reader.readBytes($size)
-        $file.write($data, 0, $size)
+    forEach ($att in $mkv.find('AttachedFile')) {
+        $file = [IO.File]::create($att.FileName)
+        $mkv.reader.baseStream.position = $att.FileData._.datapos
+        $data = $mkv.reader.readBytes($att.FileData._.size)
+        $file.write($data, 0, $data.length)
         $file.close()
     }
-    $mkv._.reader.close()
+    $mkv.reader.close()
 
 .EXAMPLE
     parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0]._.type -eq 'string' }
@@ -75,25 +79,28 @@ set-strictMode -version 4
     parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0] -is [datetime] }
 
     parseMKV 'c:\some\path\file.mkv' -print -printFilter { param($e)
-        $e._.name -match '^Chap(String|Lang|terTime)' -and $e._.closest('ChapterAtom').ChapterTimeStart.hours -ge 1
+        $e._.name -match '^Chap(String|Lang|terTime)' -and `
+        $e._.closest('ChapterAtom').ChapterTimeStart.hours -ge 1
     }
 
 .EXAMPLE
     $mkv = parseMKV 'c:\some\path\file.mkv'
 
-    $DisplayWidth = $mkv._.find('DisplayWidth')
-    $DisplayHeight = $mkv._.find('DisplayHeight')
+    $DisplayWidth = $mkv.find('DisplayWidth')
+    $DisplayHeight = $mkv.find('DisplayHeight')
     $VideoCodecID = $DisplayWidth._.closest('TrackEntry').CodecID
 
-    $DisplayWxH = $mkv.Tracks.Video._.find('', '^Display[WH]') -join 'x'
+    $DisplayWxH = $mkv.Segment.Tracks.Video._.find('', '^Display[WH]') -join 'x'
 
-    ($mkv._.find('ChapterTimeStart') | %{ $_._.displayString }) -join ", "
+    $mkv.find('ChapterTimeStart')._.displayString -join ", "
 
-    $mkv._.find('ChapterAtom') | %{
-        '{0:h\:mm\:ss}' -f $_._.find('ChapterTimeStart') +
-        " - " +
-        $_._.find('ChapString')
+    $mkv.find('FlagDefault') | ?{ $_ -eq 1 } | %{ $_._.parent|ft }
+
+    forEach ($chapter in $mkv.find('ChapterAtom')) {
+        '{0:h\:mm\:ss}' -f $chapter._.find('ChapterTimeStart') +
+        " - " + $chapter._.find('ChapString')
     }
+
 #>
 
 function parseMKV(
@@ -175,21 +182,41 @@ function parseMKV(
         $skip += '|/Tags/'
     }
 
-    $header = readRootContainer 'EBML'
+    $mkv = $dummyMeta.PSObject.copy()
+    $mkv.PSObject.members.remove('closest')
+    $mkv | add-member ([ordered]@{ type='container'; path='/'; ref=$mkv; _=$mkv})
+    $mkv.EBML = [Collections.ArrayList]@()
+    $mkv.Segment = [Collections.ArrayList]@()
 
-    if (!$state.abort) {
-        $segment = readRootContainer 'Segment'
-        $segment._.header = $header
-    } else {
-        $segment = $header
+    while (!$state.abort -and $stream.position -lt $stream.length) {
+
+        $meta = if (findNextRootContainer) { readEntry $mkv }
+
+        if (!$meta -or !$meta['ref'] -or $meta['path'] -cnotmatch '^/(EBML|Segment)/$') {
+            throw 'Cannot find EBML or Segment structure'
+        }
+
+        $container = $meta.root = $meta.ref
+        $meta.level = 0
+        $meta.root = $container
+        $meta.remove('parent')
+
+        if ($entryCallback -and (& $entryCallback $container) -eq 'abort') {
+            $state.abort = $true;
+            break
+        }
+        if ($print) {
+            printEntry $container
+        }
+
+        readChildren $container
     }
 
     if ([bool]$keepStreamOpen) {
-        $segment._.reader = $bin
+        $mkv | add-member reader $bin
     } else {
         $bin.close()
     }
-
     if ($opt.print) {
         if (!$state.print['omitLineFeed']) {
             $host.UI.writeLine()
@@ -199,38 +226,27 @@ function parseMKV(
         }
     }
 
-    $segment
+    $mkv
 }
 
 #region MAIN
 
-function readRootContainer([string]$requiredID) {
-    if ($stream.position -ge $stream.length) {
-        return
+function findNextRootContainer {
+    $toRead = 4 # EBML/Segment ID size
+    $buf = [byte[]]::new($lookupChunkSize)
+    forEach ($step in 1..128) {
+        $bufsize = $bin.read($buf, 0, $toRead)
+        $bufstr = [BitConverter]::toString($buf, 0, $bufsize)
+        forEach ($id in <#EBML#>'1A-45-DF-A3', <#Segment#>'18-53-80-67') {
+            $pos = $bufstr.indexOf($id)/3
+            if ($pos -ge 0) {
+                $stream.position -= $bufsize - $pos
+                return $true
+            }
+        }
+        $toRead = $buf.length
+        $stream.position -= 4
     }
-
-    $meta = readEntry @{ _=@{path='/'; level=-1; root=$null} }
-
-    if (!$meta -or !$meta.ref -or $meta.type -ne 'container') {
-        throw 'Not a container'
-    }
-    if ($requiredID -and $meta.name -ne $requiredID) {
-        throw "Expected '$requiredID' but got '$($meta.name)'"
-    }
-
-    $container = $meta.root = $meta.ref
-    $meta.remove('parent')
-
-    if ($opt.entryCallback -and (& $opt.entryCallback $container) -eq 'abort') {
-        $state.abort = $true;
-        return $container
-    }
-    if ($opt.print) {
-        printEntry $container
-    }
-
-    readChildren $container
-    $container
 }
 
 function readChildren($container) {
@@ -297,8 +313,6 @@ function readChildren($container) {
 }
 
 function readEntry($container) {
-    # inlining because PowerShell's overhead for a simple function call
-    # is bigger than the time to execute it
 
     function bakeTime($value=$value, $meta=$meta, [bool]$ms, [bool]$fps, [switch]$noScaling) {
         [uint64]$nanoseconds = if ([bool]$noScaling) { $value }
@@ -319,13 +333,15 @@ function readEntry($container) {
         $time
     }
 
-    $meta = $script:meta.PSObject.copy()
+    # inlining because PowerShell's overhead for a simple function call
+    # is bigger than the time to execute it
+
+    $meta = $dummyMeta.PSObject.copy()
     $meta.pos = $stream.position
 
     $buf = [byte[]]::new(8)
     $buf[0] = $_ = $bin.readByte()
     $meta.id = if ($_ -eq 0 -or $_ -eq 0xFF) {
-            write-warning "BAD ID $_"
             -1
         } else {
             $len = 8 - [byte][Math]::floor([Math]::log($_)/[Math]::log(2))
@@ -350,8 +366,7 @@ function readEntry($container) {
             $buf.clear()
             $buf[0] = $_ = $bin.readByte()
             if ($_ -eq 0 -or $_ -eq 0xFF) {
-                write-warning "BAD SIZE $_"
-                -1
+                0
             } else {
                 $len = 8 - [byte][Math]::floor([Math]::log($_)/[Math]::log(2))
                 $buf[0] = $_ = $_ -band -bnot (1 -shl (8-$len))
@@ -368,7 +383,6 @@ function readEntry($container) {
     $meta.datapos = $stream.position
 
     if (!$info) {
-        write-warning ("{0,8}: {1,8:x}`tUnknown EBML ID" -f $meta.pos, $meta.id)
         $stream.position += $size
         return $meta
     }
@@ -378,8 +392,8 @@ function readEntry($container) {
         return $null
     }
 
-    $meta.level = $container._.level + 1
-    $meta.root = $container._.root
+    $meta.level = $container._['level'] + 1
+    $meta.root = $container._['root']
     $meta.parent = $container
 
     if ($opt.skip -and $meta.path -match $opt.skip) {
@@ -511,10 +525,15 @@ function readEntry($container) {
                 $result = bakeTime -ms:$true -fps:$true -noScaling
             }
             '/TrackEntry/TrackType$' {
-                if ($typestr = $DTD.__TrackTypes[[int]$result]) {
+                if ($value = $DTD.__TrackTypes[[int]$result]) {
                     $meta.rawValue = $result
-                    $result = $typestr
-                    addNamedChild $container._.parent $typestr $container
+                    $result = $value
+                    $tracks = $container._.parent
+                    if ($existing = $tracks[$value]) {
+                        $existing.add($container) >$null
+                    } else {
+                        $tracks[$value] = [Collections.ArrayList]@($container)
+                    }
                 }
                 'DefaultDuration', 'DefaultDecodedFieldDuration' | %{
                     if ($dur = $container[$_]) {
@@ -532,10 +551,14 @@ function readEntry($container) {
     $key = $meta.name
     $existing = $container[$key]
     if ($existing -eq $null) {
-        $container[$key] = $meta.ref
+        if ($info['multiple']) {
+            $container[$key] = [Collections.ArrayList] @(,$meta.ref)
+        } else {
+            $container[$key] = $meta.ref
+        }
     } elseif ($existing -is [Collections.ArrayList]) {
         $existing.add($meta.ref) >$null
-    } else {
+    } else { # this should happen according to DTD
         $container[$key] = [Collections.ArrayList] @($existing, $meta.ref)
     }
     $meta
@@ -546,7 +569,7 @@ function locateTagsBlock($current) {
     [uint64]$end = $seg._.datapos + $seg._.size
 
     $maxBackSteps = 4096
-    $stepSize = 512
+    $stepSize = $lookupChunkSize
 
     if ($stream.position + 16*$current._.size + $maxBackSteps*$stepSize -gt $end) {
         # do nothing if the stream's end is near
@@ -561,7 +584,7 @@ function locateTagsBlock($current) {
     # some [old?] mkvs have a zero-sized Cluster with SeekPosition at the end
     $IDs[1] = $IDs[2] + '-' + $IDs[1]
 
-    foreach ($step in 1..$maxBackSteps) {
+    forEach ($step in 1..$maxBackSteps) {
         $stream.position = $start = $end - $stepSize*$step
         $buf = $bin.readBytes($stepSize + 8*2) # current code supports max 8-byte id and size
         $haystack = [BitConverter]::toString($buf)
@@ -569,7 +592,7 @@ function locateTagsBlock($current) {
         # try locating Tags first but in case the last section is
         # Clusters or Cues assume there's no Tags anywhere and just report success
         # in order for readChildren to finish its job peacefully
-        foreach ($IDhex in $IDs) {
+        forEach ($IDhex in $IDs) {
             $idlen = ($IDhex.length+1)/3
             $idpos = $buf.length
             while ($idpos -gt 0) {
@@ -608,17 +631,6 @@ function locateTagsBlock($current) {
 #endregion
 #region UTILITIES
 
-function addNamedChild($dict, [string]$key, $value) {
-    $current = $dict[$key]
-    if ($current -eq $null) {
-        $dict[$key] = $value
-    } elseif ($current -is [Collections.ArrayList]) {
-        $current.add($value) >$null
-    } else {
-        $dict[$key] = [Collections.ArrayList] @($current, $value)
-    }
-}
-
 function setEntryValue($entry, $value) {
     $meta = $entry._
     $raw = $entry.PSObject.copy(); $raw.PSObject.members.remove('_')
@@ -652,7 +664,7 @@ function decodeLongDouble([byte[]]$data) {
     if (!$j) { return $null }
 
     [int64]$f = $data[7] -band 0x7F
-    foreach ($i in 6..0) {
+    forEach ($i in 6..0) {
         $f = $f -shl 8 -bor $data[$i]
     }
 
@@ -688,7 +700,7 @@ function decodeLongDouble([byte[]]$data) {
 function printChildren($container, [switch]$includeContainers) {
     $printed = @{}
     $list = {0}.invoke()
-    foreach ($child in $container.values) {
+    forEach ($child in $container.values) {
         if ($child._.type -eq 'container' -and ![bool]$includeContainers) {
             continue
         }
@@ -698,9 +710,9 @@ function printChildren($container, [switch]$includeContainers) {
             $list[0] = $child
             $toPrint = $list
         }
-        foreach ($entry in $toPrint) {
+        forEach ($entry in $toPrint) {
             $hash = [Runtime.CompilerServices.RuntimeHelpers]::getHashCode($entry)
-            if (!$printed[$hash]) {
+            if (!$printed[$hash] -and !$entry._['skipped']) {
                 printEntry $entry
                 $printed[$hash] = $true
             }
@@ -740,7 +752,7 @@ function printEntry($entry) {
 
         $simpletags = if ($entry.SimpleTag -is [Collections.ArrayList]) { $entry.SimpleTag }
                         else { @($entry.SimpleTag) }
-        foreach ($stag in $simpletags) {
+        forEach ($stag in $simpletags) {
             if ($stag.TagName.startsWith('_STATISTICS_')) {
                 continue
             }
@@ -780,7 +792,7 @@ function printEntry($entry) {
                 }
             }
             $host.UI.writeLine()
-            
+
             if ($stag['SimpleTag']) {
                 printSimpleTags $stag
             }
@@ -910,7 +922,7 @@ function printEntry($entry) {
                 $lng = $_['ChapLanguage']
                 if (!$lng) { $lng = $DTD.__names.ChapLanguage.value }
                 if ($lng -and $lng -ne 'und') {
-                    $host.UI.write($colors.dim, 0, $lng + '/')
+                    $host.UI.write($colors.dim, 0, $lng.trim() + '/')
                 }
                 if ($_['ChapString']) {
                     $host.UI.write($colors[@('string','normal','dim')[$color]], 0, $_.ChapString)
@@ -964,7 +976,7 @@ function printEntry($entry) {
                 }
             }
             $host.UI.writeLine()
-    
+
             printSimpleTags $entry
 
             $host.UI.writeLine()
@@ -1049,8 +1061,9 @@ function init {
         '/Attachments/AttachedFile/|' +
         '/Tags/Tag/'
     $script:numberFormat = [Globalization.CultureInfo]::InvariantCulture
+    $script:lookupChunkSize = 512
 
-    $script:meta = @{}
+    $script:dummyMeta = @{}
 
     add-member scriptMethod closest { param([string]$name, [string]$match)
         # find the closest parent matching 'name' or 'match' regexp ('name' takes precedence)
@@ -1062,38 +1075,35 @@ function init {
             }
             $e = $e._['parent']
         } until ($e -eq $null)
-    } -inputObject $meta
+    } -inputObject $dummyMeta
 
     add-member scriptMethod find { param([string]$name, [string]$match)
         # find all nested children matching 'name' or 'match' regexp ('name' takes precedence)
-        # returns: $null, a single object or a [Collections.ObjectModel.Collection`1]
+        # returns: $null, a single object or Collection`1
         $results = {}.invoke()
         if ($this.type -ne 'container') {
             return $results
         }
-        $this.ref.getEnumerator().forEach({
-            $child = $_.value
-            if ($child -eq $null) {
-                return
-            }
-            $meta = $child._
-            if (($name -and $meta.name -eq $name) `
-            -or ($match -and $meta.name -match $match)) {
-                $results.add($child)
-            }
-            if ($meta.type -eq 'container') {
-                $meta.find($name,$match).forEach({
-                    # skip aliases like Video <-> TrackEntry[0]
-                    if ($results.indexOf($_) -eq -1) {
-                        $results.add($_)
+        $checked = @{}
+        forEach ($child in $this.ref.getEnumerator()) {
+            forEach ($meta in $child.value._) {
+                if (($name -and $meta.name -eq $name) `
+                -or ($match -and $meta.path -match $match)) {
+                    $hash = [Runtime.CompilerServices.RuntimeHelpers]::getHashCode($meta.ref)
+                    if (!$checked[$hash]) {
+                        $checked[$hash] = $true
+                        $results.add($meta.ref)
                     }
-                })
+                }
+                if ($meta.type -eq 'container') {
+                    forEach ($r in $meta.find($name,$match)) { $results.add($r) }
+                }
             }
-        })
+        }
         $results
-    } -inputObject $meta
+    } -inputObject $dummyMeta
 
-    $script:dummyContainer = add-member _ $meta -inputObject (@{}) -passthru
+    $script:dummyContainer = add-member _ $dummyMeta -inputObject (@{}) -passthru
 
     $script:colors = @{
         bold = 'white'
@@ -1110,7 +1120,7 @@ function init {
     }
 
     $script:DTD = @{
-        EBML = @{ id=0x1a45dfa3; type='container'; children = @{
+        EBML = @{ id=0x1a45dfa3; type='container'; multiple=$true; children = @{
             EBMLVersion = @{ id=0x4286; type='uint'; value=1 }
             EBMLReadVersion = @{ id=0x42f7; type='uint'; value=1 }
             EBMLMaxIDLength = @{ id=0x42f2; type='uint'; value=4 }
@@ -1120,42 +1130,42 @@ function init {
             DocTypeReadVersion = @{ id=0x4285; type='uint'; value=1 }
         }}
         CRC32 = @{ id=0xbf; type='binary' }
-        Void = @{ id=0xec; type='binary' }
-        Dummy = @{ id=0xff; type='binary' }
-        SignatureSlot = @{ id=0x1b538667; type='container'; children = @{
+        Void = @{ id=0xec; type='binary'; multiple=$true }
+        Dummy = @{ id=0xff; type='binary'; multiple=$true }
+        SignatureSlot = @{ id=0x1b538667; type='container'; multiple=$true; children = @{
             SignatureAlgo = @{ id=0x7e8a; type='uint' }
             SignatureHash = @{ id=0x7e9a; type='uint' }
             SignaturePublicKey = @{ id=0x7ea5; type='binary' }
             Signature = @{ id=0x7eb5; type='binary' }
             SignatureElements = @{ id=0x7e5b; type='container'; children = @{
-                SignatureElementList = @{ id=0x7e7b; type='container'; children = @{
-                    SignedElement = @{ id=0x6532; type='binary' }
+                SignatureElementList = @{ id=0x7e7b; type='container'; multiple=$true; children = @{
+                    SignedElement = @{ id=0x6532; type='binary'; multiple=$true }
                 }}
             }}
         }}
 
         # Matroska DTD
-        Segment = @{ id=0x18538067; type='container'; children = @{
+        Segment = @{ id=0x18538067; type='container'; multiple=$true; children = @{
 
             # Meta Seek Information
-            SeekHead = @{ id=0x114d9b74; type='container'; children = @{
-                Seek = @{ id=0x4dbb; type='container'; children = @{
+            SeekHead = @{ id=0x114d9b74; type='container'; multiple=$true; children = @{
+                Seek = @{ id=0x4dbb; type='container'; multiple=$true; children = @{
                     SeekID = @{ id=0x53ab; type='binary' }
                     SeekPosition = @{ id=0x53ac; type='uint' }
                 }}
             }}
 
             # Segment Information
-            Info = @{ id=0x1549a966; type='container'; children = @{
+            Info = @{ id=0x1549a966; type='container'; multiple=$true; children = @{
                 SegmentUID = @{ id=0x73a4; type='binary' }
                 SegmentFilename = @{ id=0x7384; type='string' }
                 PrevUID = @{ id=0x3cb923; type='binary' }
                 PrevFilename = @{ id=0x3c83ab; type='string' }
                 NextUID = @{ id=0x3eb923; type='binary' }
                 NextFilename = @{ id=0x3e83bb; type='string' }
-                SegmentFamily = @{ id=0x4444; type='binary' }
-                ChapterTranslate = @{ id=0x6924; type='container'; children = @{
-                    ChapterTranslateEditionUID = @{ id=0x69fc; type='uint' }
+                SegmentFamily = @{ id=0x4444; type='binary'; multiple=$true }
+                ChapterTranslate = @{ id=0x6924; type='container'; multiple=$true; children = @{
+                    ChapterTranslateEditionUID = @{ id=0x69fc; type='uint'; multiple=$true }
                     ChapterTranslateCodec = @{ id=0x69bf; type='uint' }
                     ChapterTranslateID = @{ id=0x69a5; type='binary' }
                 }}
@@ -1168,31 +1178,31 @@ function init {
             }}
 
             # Cluster
-            Cluster = @{ id=0x1f43b675; type='container'; children = @{
+            Cluster = @{ id=0x1f43b675; type='container'; multiple=$true; children = @{
                 Timecode = @{ id=0xe7; type='uint' }
                 SilentTracks = @{ id=0x5854; type='container'; children = @{
-                    SilentTrackNumber = @{ id=0x58d7; type='uint' }
+                    SilentTrackNumber = @{ id=0x58d7; type='uint'; multiple=$true }
                 }}
                 Position = @{ id=0xa7; type='uint' }
                 PrevSize = @{ id=0xab; type='uint' }
-                SimpleBlock = @{ id=0xa3; type='binary' }
-                BlockGroup = @{ id=0xa0; type='container'; children = @{
+                SimpleBlock = @{ id=0xa3; type='binary'; multiple=$true }
+                BlockGroup = @{ id=0xa0; type='container'; multiple=$true; children = @{
                     Block = @{ id=0xa1; type='binary' }
                     BlockVirtual = @{ id=0xa2; type='binary' }
                     BlockAdditions = @{ id=0x75a1; type='container'; children = @{
-                        BlockMore = @{ id=0xa6; type='container'; children = @{
+                        BlockMore = @{ id=0xa6; type='container'; multiple=$true; children = @{
                             BlockAddID = @{ id=0xee; type='uint' }
                             BlockAdditional = @{ id=0xa5; type='binary' }
                         }}
                     }}
                     BlockDuration = @{ id=0x9b; type='uint' }
                     ReferencePriority = @{ id=0xfa; type='uint' }
-                    ReferenceBlock = @{ id=0xfb; type='int' }
+                    ReferenceBlock = @{ id=0xfb; type='int'; multiple=$true }
                     ReferenceVirtual = @{ id=0xfd; type='int' }
                     CodecState = @{ id=0xa4; type='binary' }
                     DiscardPadding = @{ id=0x75a2; type='int' }
                     Slices = @{ id=0x8e; type='container'; children = @{
-                        TimeSlice = @{ id=0xe8; type='container'; children = @{
+                        TimeSlice = @{ id=0xe8; type='container'; multiple=$true; children = @{
                             LaceNumber = @{ id=0xcc; type='uint'; value=0 }
                             FrameNumber = @{ id=0xcd; type='uint'; value=0 }
                             BlockAdditionID = @{ id=0xcb; type='uint'; value=0 }
@@ -1204,13 +1214,13 @@ function init {
                         ReferenceOffset = @{ id=0xc9; type='uint'; value=0 }
                         ReferenceTimeCode = @{ id=0xca; type='uint'; value=0 }
                     }}
-                EncryptedBlock = @{ id=0xaf; type='binary' }
+                EncryptedBlock = @{ id=0xaf; type='binary'; multiple=$true }
                 }}
             }}
 
             # Track
-            Tracks = @{ id=0x1654ae6b; type='container'; children = @{
-                TrackEntry = @{ id=0xae; type='container'; children = @{
+            Tracks = @{ id=0x1654ae6b; type='container'; multiple=$true; children = @{
+                TrackEntry = @{ id=0xae; type='container'; multiple=$true; children = @{
                     TrackNumber = @{ id=0xd7; type='uint' }
                     TrackUID = @{ id=0x73c5; type='uint' }
                     TrackType = @{ id=0x83; type='uint' }
@@ -1232,14 +1242,14 @@ function init {
                     CodecName = @{ id=0x258688; type='string' }
                     AttachmentLink = @{ id=0x7446; type='uint' }
                     CodecSettings = @{ id=0x3a9697; type='string' }
-                    CodecInfoURL = @{ id=0x3b4040; type='string' }
-                    CodecDownloadURL = @{ id=0x26b240; type='string' }
+                    CodecInfoURL = @{ id=0x3b4040; type='string'; multiple=$true }
+                    CodecDownloadURL = @{ id=0x26b240; type='string'; multiple=$true }
                     CodecDecodeAll = @{ id=0xaa; type='uint'; value=1 }
-                    TrackOverlay = @{ id=0x6fab; type='uint' }
+                    TrackOverlay = @{ id=0x6fab; type='uint'; multiple=$true }
                     CodecDelay = @{ id=0x56aa; type='uint' }
                     SeekPreRoll = @{ id=0x56bb; type='uint' }
-                    TrackTranslate = @{ id=0x6624; type='container'; children = @{
-                        TrackTranslateEditionUID = @{ id=0x66fc; type='uint' }
+                    TrackTranslate = @{ id=0x6624; type='container'; multiple=$true; children = @{
+                        TrackTranslateEditionUID = @{ id=0x66fc; type='uint'; multiple=$true }
                         TrackTranslateCodec = @{ id=0x66bf; type='uint' }
                         TrackTranslateTrackID = @{ id=0x66a5; type='binary' }
                     }}
@@ -1276,13 +1286,13 @@ function init {
 
                     TrackOperation = @{ id=0xe2; type='container'; children = @{
                         TrackCombinePlanes = @{ id=0xe3; type='container'; children = @{
-                            TrackPlane = @{ id=0xe4; type='container'; children = @{
+                            TrackPlane = @{ id=0xe4; type='container'; multiple=$true; children = @{
                                 TrackPlaneUID = @{ id=0xe5; type='uint' }
                                 TrackPlaneType = @{ id=0xe6; type='uint' }
                             }}
                         }}
                         TrackJoinBlocks = @{ id=0xe9; type='container'; children = @{
-                            TrackJoinUID = @{ id=0xed; type='uint' }
+                            TrackJoinUID = @{ id=0xed; type='uint'; multiple=$true }
                         }}
                     }}
 
@@ -1294,7 +1304,7 @@ function init {
 
                     # Content Encoding
                     ContentEncodings = @{ id=0x6d80; type='container'; children = @{
-                        ContentEncoding = @{ id=0x6240; type='container'; children = @{
+                        ContentEncoding = @{ id=0x6240; type='container'; multiple=$true; children = @{
                             ContentEncodingOrder = @{ id=0x5031; type='uint'; value=0 }
                             ContentEncodingScope = @{ id=0x5032; type='uint'; value=1 }
                             ContentEncodingType = @{ id=0x5033; type='uint' }
@@ -1317,16 +1327,16 @@ function init {
 
             # Cueing Data
             Cues = @{ id=0x1c53bb6b; type='container'; children = @{
-                CuePoint = @{ id=0xbb; type='container'; children = @{
+                CuePoint = @{ id=0xbb; type='container'; multiple=$true; children = @{
                     CueTime = @{ id=0xb3; type='uint' }
-                    CueTrackPositions = @{ id=0xb7; type='container'; children = @{
+                    CueTrackPositions = @{ id=0xb7; type='container'; multiple=$true; children = @{
                         CueTrack = @{ id=0xf7; type='uint' }
                         CueClusterPosition = @{ id=0xf1; type='uint' }
                         CueRelativePosition = @{ id=0xf0; type='uint' }
                         CueDuration = @{ id=0xb2; type='uint' }
                         CueBlockNumber = @{ id=0x5378; type='uint'; value=1 }
                         CueCodecState = @{ id=0xea; type='uint'; value=0 }
-                        CueReference = @{ id=0xdb; type='container'; children = @{
+                        CueReference = @{ id=0xdb; type='container'; multiple=$true; children = @{
                             CueRefTime = @{ id=0x96; type='uint' }
                             CueRefCluster = @{ id=0x97; type='uint' }
                             CueRefNumber = @{ id=0x535f; type='uint'; value=1 }
@@ -1338,7 +1348,7 @@ function init {
 
             # Attachment
             Attachments = @{ id=0x1941a469; type='container'; children = @{
-                AttachedFile = @{ id=0x61a7; type='container'; children = @{
+                AttachedFile = @{ id=0x61a7; type='container'; multiple=$true; children = @{
                     FileDescription = @{ id=0x467e; type='string' }
                     FileName = @{ id=0x466e; type='string' }
                     FileMimeType = @{ id=0x4660; type='string' }
@@ -1352,12 +1362,12 @@ function init {
 
             # Chapters
             Chapters = @{ id=0x1043a770; type='container'; children = @{
-                EditionEntry = @{ id=0x45b9; type='container'; children = @{
+                EditionEntry = @{ id=0x45b9; type='container'; multiple=$true; children = @{
                     EditionUID = @{ id=0x45bc; type='uint' }
                     EditionFlagHidden = @{ id=0x45bd; type='uint' }
                     EditionFlagDefault = @{ id=0x45db; type='uint' }
                     EditionFlagOrdered = @{ id=0x45dd; type='uint' }
-                    ChapterAtom = @{ id=0xb6; type='container'; children = @{
+                    ChapterAtom = @{ id=0xb6; type='container'; multiple=$true; children = @{
                         ChapterUID = @{ id=0x73c4; type='uint' }
                         ChapterStringUID = @{ id=0x5654; type='binary' }
                         ChapterTimeStart = @{ id=0x91; type='uint' }
@@ -1368,17 +1378,17 @@ function init {
                         ChapterSegmentEditionUID = @{ id=0x6ebc; type='uint' }
                         ChapterPhysicalEquiv = @{ id=0x63c3; type='uint' }
                         ChapterTrack = @{ id=0x8f; type='container'; children = @{
-                            ChapterTrackNumber = @{ id=0x89; type='uint' }
+                            ChapterTrackNumber = @{ id=0x89; multiple=$true; type='uint' }
                         }}
-                        ChapterDisplay = @{ id=0x80; type='container'; children = @{
+                        ChapterDisplay = @{ id=0x80; type='container'; multiple=$true; children = @{
                             ChapString = @{ id=0x85; type='string' }
-                            ChapLanguage = @{ id=0x437c; type='string'; value='eng' }
-                            ChapCountry = @{ id=0x437e; type='string' }
+                            ChapLanguage = @{ id=0x437c; type='string'; multiple=$true; value='eng' }
+                            ChapCountry = @{ id=0x437e; type='string'; multiple=$true }
                         }}
-                        ChapProcess = @{ id=0x6944; type='container'; children = @{
+                        ChapProcess = @{ id=0x6944; type='container'; multiple=$true; children = @{
                             ChapProcessCodecID = @{ id=0x6955; type='uint' }
                             ChapProcessPrivate = @{ id=0x450d; type='binary' }
-                            ChapProcessCommand = @{ id=0x6911; type='container'; children = @{
+                            ChapProcessCommand = @{ id=0x6911; type='container'; multiple=$true; children = @{
                                 ChapProcessTime = @{ id=0x6922; type='uint' }
                                 ChapProcessData = @{ id=0x6933; type='binary' }
                             }}
@@ -1388,17 +1398,17 @@ function init {
             }}
 
             # Tagging
-            Tags = @{ id=0x1254c367; type='container'; children = @{
-                Tag = @{ id=0x7373; type='container'; children = @{
+            Tags = @{ id=0x1254c367; type='container'; multiple=$true; children = @{
+                Tag = @{ id=0x7373; type='container'; multiple=$true; children = @{
                     Targets = @{ id=0x63c0; type='container'; children = @{
                         TargetTypeValue = @{ id=0x68ca; type='uint' }
                         TargetType = @{ id=0x63ca; type='string' }
-                        TagTrackUID = @{ id=0x63c5; type='uint'; value=0 }
-                        TagEditionUID = @{ id=0x63c9; type='uint' }
-                        TagChapterUID = @{ id=0x63c4; type='uint'; value=0 }
-                        TagAttachmentUID = @{ id=0x63c6; type='uint'; value=0 }
+                        TagTrackUID = @{ id=0x63c5; type='uint'; multiple=$true; value=0 }
+                        TagEditionUID = @{ id=0x63c9; type='uint'; multiple=$true }
+                        TagChapterUID = @{ id=0x63c4; type='uint'; multiple=$true; value=0 }
+                        TagAttachmentUID = @{ id=0x63c6; type='uint'; multiple=$true; value=0 }
                     }}
-                    SimpleTag = @{ id=0x67c8; type='container'; children = @{
+                    SimpleTag = @{ id=0x67c8; type='container'; multiple=$true; children = @{
                         TagName = @{ id=0x45a3; type='string' }
                         TagLanguage = @{ id=0x447a; type='string' }
                         TagDefault = @{ id=0x4484; type='uint' }
