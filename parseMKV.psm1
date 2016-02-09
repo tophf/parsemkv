@@ -711,6 +711,21 @@ function printEntry($entry) {
         "$($x/$a):$($y/$a)"
     }
 
+    function prettySize([uint64]$size) {
+        [uint64]$base = 0x10000000000
+        $s = $alt = ''
+        @('TiB','GiB','MiB','KiB').where({
+            if ($size / $base -lt 1) {
+                $base = $base -shr 10
+            } else {
+                $alt = ($size / $base).toString('g3', $numberFormat) + ' ' + $_
+                $true
+            }
+        }, 'first') >$null
+        $s = $size.toString('n0', $numberFormat) + ' bytes'
+        if ($alt) { $alt, " ($s)" } else { $s, '' }
+    }
+
     $meta = $entry._
     if ($meta['skipped']) {
         return
@@ -733,13 +748,14 @@ function printEntry($entry) {
     $emptyBinary = $meta.type -eq 'binary' -and !$entry.length
     if ($emptyBinary -and $last['emptyBinary'] -and $last['path'] -eq $meta.path) {
         $last['skipped']++
-        $host.UI.write('.')
+        $last['skippedSize'] += $meta.size
         return
     }
     if ($last['path']) {
         if ($last['skipped']) {
-            $host.UI.writeLine(8,0, " [$($last.skipped)]")
-            $last.skipped = 0
+            $host.UI.writeLine($colors.dim, 0,
+                " [$($last.skipped) entries skipped, $((prettySize $last.skippedSize) -join '')]")
+            $last.skipped = $last.skippedSize = 0
         } elseif (!$last['omitLineFeed']) {
             $host.UI.writeLine()
         } else {
@@ -892,20 +908,8 @@ function printEntry($entry) {
                     'NUMBER_OF_FRAMES' {
                         ([uint64]$stag.TagString).toString('n0', $numberFormat); $alt = ' frames' }
                     'NUMBER_OF_BYTES' {
-                        [uint64]$size = $stag.TagString
-                        [uint64]$base = 0x10000000000
-                        $alt = ''
-                        @('TiB','GiB','MiB','KiB').where({
-                            if ($size / $base -lt 1) {
-                                $base = $base -shr 10
-                            } else {
-                                $alt = ($size / $base).toString('g3', $numberFormat) + ' ' + $_
-                                $true
-                            }
-                        }, 'first') >$null
-                        $s = $size.toString('n0', $numberFormat) + ' bytes'
-                        if ($alt) { $alt; $alt = " ($s)" }
-                        else { $s }
+                        $s, $alt = prettySize $stag.TagString
+                        $s
                     }
                 }
                 if ($stats) {
