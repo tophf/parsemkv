@@ -147,14 +147,20 @@ function parseMKV(
         print = @{ tick=[datetime]::now.ticks }
         timecodeScale = $DTD.__names.TimecodeScale.value
     }
-    # -printRaw implies -print
-    if ([bool]$printRaw) {
-        $print = $printRaw
-    }
     # less ambiguous local alias
-    $tagsAction = $tags
-    if ($tags -eq 'skip' -or ($tags -eq 'read-when-printing' -and ![bool]$print)) {
-        $skip += '|/Tags/'
+    $opt = @{
+        stopOn = $stopOn
+        skip = $skip + (&{
+            if ($tags -eq 'skip' -or ($tags -eq 'read-when-printing' -and ![bool]$print)) {
+                '|/Tags/'
+            }
+        })
+        tags = $tags
+        binarySizeLimit = $binarySizeLimit
+        print = [bool]$print -or [bool]$printRaw
+        printRaw = [bool]$printRaw
+        printFilter = $printFilter
+        entryCallback = $entryCallback
     }
 
     $header = readRootContainer 'EBML'
@@ -172,7 +178,7 @@ function parseMKV(
         $bin.close()
     }
 
-    if ([bool]$print) {
+    if ($opt.print) {
         if (!$state.print['omitLineFeed']) {
             $host.UI.writeLine()
         }
@@ -191,24 +197,21 @@ function readRootContainer([string]$requiredID) {
 
     $meta = readEntry @{ _=@{path='/'; level=-1; root=$null} }
 
-    if (!$meta -or !$meta.ref) {
+    if (!$meta -or !$meta.ref -or $meta.type -ne 'container') {
         throw 'Not a container'
     }
 
     $container = $meta.root = $meta.ref
     $meta.remove('parent')
 
-    if ($meta.type -ne 'container') {
-        throw 'Not a container'
-    }
     if ($requiredID -and $meta.name -ne $requiredID) {
         throw "Expected '$requiredID' but got '$($meta.name)'"
     }
-    if ($entryCallback -and (& $entryCallback $container) -eq 'abort') {
+    if ($opt.entryCallback -and (& $opt.entryCallback $container) -eq 'abort') {
         $state.abort = $true;
         return $container
     }
-    if ([bool]$print) {
+    if ($opt.print) {
         printEntry $container
     }
 
@@ -229,22 +232,22 @@ function readChildren($container) {
 
         $child = $meta.ref
 
-        if ($entryCallback -and (& $entryCallback $child) -eq 'abort') {
+        if ($opt.entryCallback -and (& $opt.entryCallback $child) -eq 'abort') {
             $state.abort = $true
             break
         }
         if ($meta['skipped']) {
             if (!$state['exhaustiveSearch']) {
-                if ($tagsAction -ne 'skip' -and (locateTagsBlock $child)) {
+                if ($opt.tags -ne 'skip' -and (locateTagsBlock $child)) {
                     continue
                 }
-                if ($tagsAction -ne 'exhaustive-search') {
+                if ($opt.tags -ne 'exhaustive-search') {
                     $stream.position = $stopAt
                     break
                 }
                 $state.exhaustiveSearch = $true
             }
-            if ([bool]$print) {
+            if ($opt.print) {
                 $ms = ([datetime]::now.ticks - $state.print.tick)/10000
                 if ($ms -gt 300) {
                     $done = $meta.pos / $stream.length
@@ -259,11 +262,11 @@ function readChildren($container) {
         if ($meta.type -ne 'container') {
             continue
         }
-        if (![bool]$print) {
+        if (!$opt.print) {
             readChildren $child
             continue
         }
-        if ([bool]$printRaw) {
+        if ($opt.printRaw) {
             printEntry $child
             readChildren $child
             continue
@@ -284,7 +287,7 @@ function readChildren($container) {
         }
     }
 
-    if ([bool]$print -and !$state.abort -and !$state.print['postponed']) {
+    if ($opt.print -and !$state.abort -and !$state.print['postponed']) {
         printChildren $container
     }
 }
@@ -366,7 +369,7 @@ function readEntry($container) {
         return $meta
     }
 
-    if ($stopOn -and $meta.path -match $stopOn) {
+    if ($opt.stopOn -and $meta.path -match $opt.stopOn) {
         $stream.position = $meta.pos
         return $null
     }
@@ -375,7 +378,7 @@ function readEntry($container) {
     $meta.root = $container._.root
     $meta.parent = $container
 
-    if ($skip -and $meta.path -match $skip) {
+    if ($opt.skip -and $meta.path -match $opt.skip) {
         $stream.position += $size
         $meta.ref = [ordered]@{ _=$meta }
         $meta.skipped = $true
@@ -435,8 +438,8 @@ function readEntry($container) {
                 $value = [Text.Encoding]::UTF8.getString($bin.readBytes($size))
             }
             'binary' {
-                $readSize = if ($binarySizeLimit -lt 0) { $size }
-                            else { [Math]::min($binarySizeLimit,$size) }
+                $readSize = if ($opt.binarySizeLimit -lt 0) { $size }
+                            else { [Math]::min($opt.binarySizeLimit,$size) }
                 if ($readSize) {
                     $value = $bin.ReadBytes($readSize)
                     if ($meta.name -cmatch '\wUID$') {
@@ -705,12 +708,12 @@ function printEntry($entry) {
     if ($meta['skipped']) {
         return
     }
-    if ($printFilter -is [string]) {
-        if (!($meta.path -match $printFilter)) {
+    if ($opt.printFilter -is [string]) {
+        if (!($meta.path -match $opt.printFilter)) {
             return
         }
-    } elseif ($printFilter -is [scriptblock]) {
-        if (!(& $printFilter $entry)) {
+    } elseif ($opt.printFilter -is [scriptblock]) {
+        if (!(& $opt.printFilter $entry)) {
             return
         }
     }
@@ -1334,7 +1337,7 @@ function init {
     }
 
     $names = flattenDTD $DTD
-    $IDs=flattenDTD $DTD -byID:$true
+    $IDs = flattenDTD $DTD -byID:$true
 
     $DTD.__names = $names
     $DTD.__IDs = $IDs
