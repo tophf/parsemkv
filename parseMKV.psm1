@@ -160,17 +160,16 @@ function parseMKV(
     # less ambiguous local alias
     $opt = @{
         stopOn = $stopOn
-        skip = $skip + (&{
-            if ($tags -eq 'skip' -or ($tags -eq 'read-when-printing' -and ![bool]$print)) {
-                '|/Tags/'
-            }
-        })
+        skip = $skip
         tags = $tags
         binarySizeLimit = $binarySizeLimit
         print = [bool]$print -or [bool]$printRaw
         printRaw = [bool]$printRaw
         printFilter = $printFilter
         entryCallback = $entryCallback
+    }
+    if ($tags -eq 'skip' -or ($tags -eq 'read-when-printing' -and !$opt.print)) {
+        $skip += '|/Tags/'
     }
 
     $header = readRootContainer 'EBML'
