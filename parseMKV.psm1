@@ -15,15 +15,18 @@ set-strictMode -version 4
     Input file path
 
 .PARAMETER stopOn
-    Stop parsing when /an/entry/path/ matches the regex pattern, case-insensitive, specify an empty string to disable
+    Stop parsing when /an/entry/path/ matches the regex pattern, case-insensitive.
+    Specify an empty string to disable
 
 .PARAMETER binarySizeLimit
     Do not autoread binary data bigger than this number of bytes, specify -1 for no limit
 
 .PARAMETER entryCallback
-    Code block to be called on each entry. Some time/date/tracktype values are yet raw numbers because processing happens after all child elements of a container are read.
+    Code block to be called on each entry.
+    Some time/date/tracktype values may be yet raw numbers because processing is 
+    guaranteed to occur only after all child elements of a container are read.
     Parameters: entry (with its metadata in _ property).
-    Code block may return 'abort' to stop all processing, otherwise the output is ignored.
+    Return value: 'abort' to stop all processing, otherwise ignored.
     //TODO: consider allowing to 'skip' current element.
 
 .PARAMETER keepStreamOpen
@@ -734,6 +737,58 @@ function printEntry($entry) {
         if ($alt) { $alt, " ($s)" } else { $s, '' }
     }
 
+    function printSimpleTags($entry) {
+        $statsDelim = '  '*($entry._.level+1)
+
+        $simpletags = if ($entry.SimpleTag -is [Collections.ArrayList]) { $entry.SimpleTag }
+                        else { @($entry.SimpleTag) }
+        foreach ($stag in $simpletags) {
+            if ($stag.TagName.startsWith('_STATISTICS_')) {
+                continue
+            }
+            $stats = switch ($stag.TagName) {
+                'BPS' {
+                    ($stag.TagString / 1000).toString('n0', $numberFormat); $alt = ' kbps' }
+                'DURATION' {
+                    $stag.TagString -replace '.{6}$',''; $alt = '' }
+                'NUMBER_OF_FRAMES' {
+                    ([uint64]$stag.TagString).toString('n0', $numberFormat); $alt = ' frames' }
+                'NUMBER_OF_BYTES' {
+                    $s, $alt = prettySize $stag.TagString
+                    $s
+                }
+            }
+            if ($stats) {
+                $host.UI.write($colors.dim, 0, $statsDelim)
+                $host.UI.write($colors[@('value','normal')[[int]!$alt]], 0, $stats)
+                $host.UI.write($colors.dim, 0, $alt)
+                $statsDelim = ', '
+                continue
+            }
+            $default = if ($stag['TagDefault'] -eq 1) { '*' } else { '' }
+            $flags = $default + $stag['TagLanguage']
+            $host.UI.write($colors.normal, 0,
+                ('  '*$stag._.level) + $stag.TagName + ($flags -replace '^\*eng$',': '))
+            $host.UI.write($colors.dim, 0, ("/$flags" -replace '/(\*eng)?$','') + ': ')
+            if ($stag.contains('TagString')) {
+                $host.UI.write($colors.stringdim2, 0, $stag.TagString)
+            } elseif ($stag.contains('TagBinary')) {
+                $tb = $stag.TagBinary
+                if ($tb.length) {
+                    $ellipsis = if ($tb.length -lt $tb._.size) { '...' } else { '' }
+                    $host.UI.write($colors.dim, 0, "[$($tb._.size) bytes] ")
+                    $host.UI.write($colors.stringdim2, 0,
+                        ((bin2hex $tb) -replace '(.{8})', '$1 ') + $ellipsis)
+                }
+            }
+            $host.UI.writeLine()
+            
+            if ($stag['SimpleTag']) {
+                printSimpleTags $stag
+            }
+        }
+    }
+
     $meta = $entry._
     if ($meta['skipped']) {
         return
@@ -854,7 +909,8 @@ function printEntry($entry) {
                 if ($i -gt 0) {
                     $host.UI.write($colors.dim, 0, ' ')
                 }
-                $lng = $_['ChapLanguage']; if (!$lng) { $lng = $DTD.__names.ChapLanguage.value }
+                $lng = $_['ChapLanguage']
+                if (!$lng) { $lng = $DTD.__names.ChapLanguage.value }
                 if ($lng -and $lng -ne 'und') {
                     $host.UI.write($colors.dim, 0, $lng + '/')
                 }
@@ -890,69 +946,31 @@ function printEntry($entry) {
             if ($tracks -isnot [Collections.ArrayList]) { $tracks = @($tracks) }
             $host.UI.write($colors.container, 0, ('  '*$meta.level) + 'Tags ')
 
-            $targets = if ($entry.Targets -is [Collections.ArrayList]) { $entry.Targets } else { @($entry.Targets) }
+            if ($entry.Targets -is [Collections.ArrayList]) {
+                $targets = $entry.Targets
+            } else {
+                $targets = @($entry.Targets)
+            }
             $targets = $targets | %{ $comma = '' } {
-                $UID = $_.TagTrackUID
-                $track = $tracks.where({ $_.TrackUID -eq $UID }, 'first')
-                if ($track) {
-                    $track = $track[0]
-                    $host.UI.write($colors.normal, 0, $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
-                    if ($track['Name']) {
-                        $host.UI.write($colors.reference, 0, ' (' + $track.Name + ')')
+                if ($UID = $_['TagTrackUID']) {
+                    $track = $tracks.where({ $_.TrackUID -eq $UID }, 'first')
+                    if ($track) {
+                        $track = $track[0]
+                        $host.UI.write($colors.normal, 0,
+                            $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
+                        if ($track['Name']) {
+                            $host.UI.write($colors.reference, 0, ' (' + $track.Name + ')')
+                        }
                     }
+                    $comma = ', '
                 }
-                $comma = ', '
-            }
-
-            $host.UI.writeLine()
-            $statsDelim = '  '*($entry._.level+1)
-
-            $simpletags = if ($entry.SimpleTag -is [Collections.ArrayList]) { $entry.SimpleTag }
-                          else { @($entry.SimpleTag) }
-            foreach ($stag in $simpletags) {
-                if ($stag.TagName.startsWith('_STATISTICS_')) {
-                    continue
-                }
-                $stats = switch ($stag.TagName) {
-                    'BPS' {
-                        ($stag.TagString / 1000).toString('n0', $numberFormat); $alt = ' kbps' }
-                    'DURATION' {
-                        $stag.TagString -replace '.{6}$',''; $alt = '' }
-                    'NUMBER_OF_FRAMES' {
-                        ([uint64]$stag.TagString).toString('n0', $numberFormat); $alt = ' frames' }
-                    'NUMBER_OF_BYTES' {
-                        $s, $alt = prettySize $stag.TagString
-                        $s
-                    }
-                }
-                if ($stats) {
-                    $host.UI.write($colors.dim, 0, $statsDelim)
-                    $host.UI.write($colors[@('value','normal')[[int]!$alt]], 0, $stats)
-                    $host.UI.write($colors.dim, 0, $alt)
-                    $statsDelim = ', '
-                    continue
-                }
-                $default = if ($stag['TagDefault'] -eq 1) { '*' } else { '' }
-                $flags = $default + $stag.TagLanguage
-                $host.UI.write($colors.normal, 0,
-                    ('  '*$stag._.level) + $stag.TagName + ($flags -replace '^\*eng$',': '))
-                if ($flags -ne '*eng') {
-                    $host.UI.write($colors.dim, 0, '/' + $flags + ': ')
-                }
-                if ($stag.contains('TagString')) {
-                    $host.UI.write($colors.stringdim2, 0, $stag.TagString)
-                } elseif ($stag.contains('TagBinary')) {
-                    $tb = $stag.TagBinary
-                    if ($tb.length) {
-                        $ellipsis = if ($tb.length -lt $tb._.size) { '...' } else { '' }
-                        $host.UI.write($colors.dim, 0, "[$($tb._.size) bytes] ")
-                        $host.UI.write($colors.stringdim2, 0,
-                            ((bin2hex $tb) -replace '(.{8})', '$1 ') + $ellipsis)
-                    }
-                }
-                $host.UI.writeLine()
             }
             $host.UI.writeLine()
+    
+            printSimpleTags $entry
+
+            $host.UI.writeLine()
+            $last.omitLineFeed = $true
             return
         }
         '/Info/(DateUTC|(Muxing|Writing)App)$' {
