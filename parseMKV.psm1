@@ -94,13 +94,16 @@ set-strictMode -version 4
 #>
 
 function parseMKV(
-        [string] [parameter(mandatory)] [validateScript({test-path -literal $_})]
+        [string] [validateScript({ if (test-path -literal $_) { $true }
+                                   else { write-warning 'File not found'; throw } })]
     $filepath,
 
-        [string] [validateScript({'' -match $_ -or $true})]
+        [string] [validateScript({ try { if ('' -match $_ -or $true) { $true } }
+                                   catch { write-warning 'Bad regex'; throw $_ } })]
     $stopOn,
 
-        [string] [validateScript({'' -match $_ -or $true})]
+        [string] [validateScript({ try { if ('' -match $_ -or $true) { $true } }
+                                   catch { write-warning 'Bad regex'; throw $_ } })]
     $skip = '^/Segment/(Cluster|Cue)', <# checked only after -stopOn #>
 
         [string] [validateSet('skip','read-when-printing','read','exhaustive-search')]
@@ -118,8 +121,15 @@ function parseMKV(
         [switch]
     $printRaw,
 
-        [validateScript({($_ -is [string] -and ('' -match $_ -or $true)) -or $_ -is [scriptblock]})]
-    $printFilter = '^(?!.*?/(SeekHead/|EBML/|Void\b))', <# string/scriptblock #>
+        [validateScript({
+            if ($_ -is [string]) {
+                try { if ('' -match $_ -or $true) { $true } }
+                catch { write-warning 'Bad regex'; throw $_ }
+            } elseif ($_ -is [scriptblock]) { $true
+            } else { throw 'Should be a string or scriptblock'
+            }
+        })]
+    $printFilter = '^(?!.*?/(SeekHead/|EBML/|Void\b))',
 
         [scriptblock]
     $entryCallback
