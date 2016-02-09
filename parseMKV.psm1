@@ -246,7 +246,24 @@ function readChildren($container) {
             $state.abort = $true
             break
         }
-        if ($meta['skipped']) {
+        if (!$meta['skipped']) {
+            if ($meta.type -ne 'container') {
+                continue
+            }
+            if (!$opt.print -or $state.print['postponed']) {
+                readChildren $child
+            } elseif ($meta.path -cnotmatch $printPostponed -or $opt.printRaw) {
+                printEntry $child
+                readChildren $child
+            } elseif ($matches) {
+                $state.print.postponed = $true
+                readChildren $child
+                printEntry $child
+                printChildren $child -includeContainers
+                $state.print.postponed = $false
+            }
+            continue
+        } else {
             if (!$state['exhaustiveSearch']) {
                 if ($opt.tags -ne 'skip' -and (locateTagsBlock $child)) {
                     continue
@@ -267,33 +284,6 @@ function readChildren($container) {
                         -secondsRemaining ($silentSeconds / $done - $silentSeconds + 1)
                 }
             }
-            continue
-        }
-        if ($meta.type -ne 'container') {
-            continue
-        }
-        if (!$opt.print) {
-            readChildren $child
-            continue
-        }
-        if ($opt.printRaw) {
-            printEntry $child
-            readChildren $child
-            continue
-        }
-        if ($state.print['postponed']) {
-            readChildren $child
-            continue
-        }
-        if ($meta.path -cmatch $printPostponed) {
-            $state.print.postponed = $true
-            readChildren $child
-            printEntry $child
-            printChildren $child -includeContainers
-            $state.print.postponed = $false
-        } else {
-            printEntry $child
-            readChildren $child
         }
     }
 
