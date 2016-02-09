@@ -248,13 +248,13 @@ function readChildren($container) {
                 $state.exhaustiveSearch = $true
             }
             if ($opt.print) {
-                $ms = ([datetime]::now.ticks - $state.print.tick)/10000
-                if ($ms -gt 300) {
+                $silentSeconds = ([datetime]::now.ticks - $state.print.tick)/10000000
+                if ($silentSeconds -gt 0.3) {
                     $done = $meta.pos / $stream.length
                     $state.print.progress = "Skipping $($meta.name) elements"
                     write-progress $state.print.progress `
                         -percentComplete ($done * 100) `
-                        -secondsRemaining (($ms / $done - $ms) / 1000 + 1)
+                        -secondsRemaining ($silentSeconds / $done - $silentSeconds + 1)
                 }
             }
             continue
