@@ -669,22 +669,26 @@ function decodeLongDouble([byte[]]$data) {
 #####################################################################################################
 
 function printChildren($container, [switch]$includeContainers) {
-    $container.values.forEach({
-        if ($_._.type -eq 'container' -and ![bool]$includeContainers) {
-            return
+    $printed = @{}
+    $list = {0}.invoke()
+    foreach ($child in $container.values) {
+        if ($child._.type -eq 'container' -and ![bool]$includeContainers) {
+            continue
         }
-        if ($_ -is [Collections.ArrayList]) {
-            $_.forEach({
-                if (!$_._['printed']) {
-                    printEntry $_
-                    $_._.printed = $true
-                }
-            })
-        } elseif (!$_._['printed']) {
-            printEntry $_
-            $_._.printed = $true
+        if ($child -is [Collections.ArrayList]) {
+            $toPrint = $child
+        } else {
+            $list[0] = $child
+            $toPrint = $list
         }
-    })
+        foreach ($entry in $toPrint) {
+            $hash = [Runtime.CompilerServices.RuntimeHelpers]::getHashCode($entry)
+            if (!$printed[$hash]) {
+                printEntry $entry
+                $printed[$hash] = $true
+            }
+        }
+    }
 }
 
 function printEntry($entry) {
