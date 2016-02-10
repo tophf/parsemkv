@@ -362,7 +362,9 @@ function readEntry($container) {
         $subpath = $container._.path.substring(1)
         while ($subpath) {
             $s, $subpath = $subpath -split '/', 2
-            $info = $info[$s]
+            if (!$info._['nesting'] -or $s -ne $info._.name) {
+                $info = $info[$s]
+            }
         }
         $info = $info._.IDs[$idhex]
     }
@@ -1066,7 +1068,13 @@ function showProgressIfStuck {
 function init {
 
     function addReverseMapping([hashtable]$container) {
+
         $container._.IDs = @{}
+
+        if ($container._['nesting']) {
+            $container._.IDs['{0:x}' -f $container._.id] = $container
+        }
+
         $container.getEnumerator().forEach({
             if ($_.key -ne '_') {
                 $v = $_.value
@@ -1436,7 +1444,7 @@ function init {
                     EditionFlagHidden = @{ _=@{ id=0x45bd; type='uint' } }
                     EditionFlagDefault = @{ _=@{ id=0x45db; type='uint' } }
                     EditionFlagOrdered = @{ _=@{ id=0x45dd; type='uint' } }
-                    ChapterAtom = @{ _=@{ id=0xb6; type='container'; multiple=$true }
+                    ChapterAtom = @{ _=@{ id=0xb6; type='container'; multiple=$true; nesting=$true }
                         ChapterUID = @{ _=@{ id=0x73c4; type='uint' } }
                         ChapterStringUID = @{ _=@{ id=0x5654; type='binary' } }
                         ChapterTimeStart = @{ _=@{ id=0x91; type='uint' } }
@@ -1477,7 +1485,7 @@ function init {
                         TagChapterUID = @{ _=@{ id=0x63c4; type='uint'; multiple=$true; value=0 } }
                         TagAttachmentUID = @{ _=@{ id=0x63c6; type='uint'; multiple=$true; value=0 } }
                     }
-                    SimpleTag = @{ _=@{ id=0x67c8; type='container'; multiple=$true }
+                    SimpleTag = @{ _=@{ id=0x67c8; type='container'; multiple=$true; nesting=$true }
                         TagName = @{ _=@{ id=0x45a3; type='string' } }
                         TagLanguage = @{ _=@{ id=0x447a; type='string' } }
                         TagDefault = @{ _=@{ id=0x4484; type='uint' } }
