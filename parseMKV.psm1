@@ -489,9 +489,9 @@ function readEntry($container) {
                         } elseif ($meta.name -eq '?') {
                             $s = [Text.Encoding]::UTF8.getString($value)
                             if ($s -cmatch '^[\x20-\x7F]+$') {
-                                $meta.displayString = 
+                                $meta.displayString =
                                     [BitConverter]::toString($value, 0, [Math]::min(16,$value.length)) +
-                                    @('','...')[[int]($readSize -gt 16)] + 
+                                    @('','...')[[int]($readSize -gt 16)] +
                                     " possible ASCII string: $s"
                             }
                         }
@@ -892,7 +892,7 @@ function printEntry($entry) {
                     if ($SAR -eq $DAR) {
                         $SAR = ''
                     } else {
-                        $DARden = $DAR -replace '^.+?:',''
+                        $DARden = ($DAR -split ':')[-1]
                         $DAR = "DAR $DAR"
                         $PAR = xy2ratio ($dw*$h) ($w*$dh)
                         $SAR = ', orig ' + ($w / $h).toString('g4',$numberFormat) + ", PAR $PAR"
@@ -905,15 +905,12 @@ function printEntry($entry) {
                     $host.UI.write($colors.value, 0, $fps)
                 }
                 'Audio' {
-                    $ch = $meta.find('Channels')
-                    if ($ch) { $s += "${ch}ch " }
-
+                    $s += if ($ch = $meta.find('Channels')) { "${ch}ch " }
                     $hz = $meta.find('SamplingFrequency')
-                    $hzOut = $meta.find('OutputSamplingFrequency'); if (!$hzOut) { $hzOut = $hz }
-                    if ($hzOut) { $s += ($hzOut/1000).toString($numberFormat) + 'kHz ' }
-                    if ($hzOut -and $hzOut -ne $hz) { $s += '(SBR) ' }
-                    $bits = $meta.find('BitDepth')
-                    if ($bits) { $s += "${bits}bit " }
+                    if (!($hzOut = $meta.find('OutputSamplingFrequency'))) { $hzOut = $hz }
+                    $s += if ($hzOut) { ($hzOut/1000).toString($numberFormat) + 'kHz ' }
+                    $s += if ($hzOut -and $hzOut -ne $hz) { '(SBR) ' }
+                    $s += if ($bits = $meta.find('BitDepth')) { "${bits}bit " }
                     $host.UI.write($colors.value, 0, $s)
                 }
             }
@@ -941,19 +938,18 @@ function printEntry($entry) {
                 $entry.ChapterTimeStart._.displayString + ' ')
             $host.UI.write($colors.dim, 0,
                 ($flags -replace '.$', '$0 '))
-            $entry['ChapterDisplay'] | %{ $i = 0 } {
-                if ($i -gt 0) {
+            forEach ($display in $entry['ChapterDisplay']) {
+                if ($display -ne $entry.ChapterDisplay[0]) {
                     $host.UI.write($colors.dim, 0, ' ')
                 }
-                $lng = $_['ChapLanguage']
+                $lng = $display['ChapLanguage']
                 if (!$lng) { $lng = $DTD.Segment.Chapters.ChapterDisplay.ChapLanguage._.value }
                 if ($lng -and $lng -ne 'und') {
                     $host.UI.write($colors.dim, 0, $lng.trim() + '/')
                 }
-                if ($_['ChapString']) {
-                    $host.UI.write($colors[@('string','normal','dim')[$color]], 0, $_.ChapString)
+                if ($display['ChapString']) {
+                    $host.UI.write($colors[@('string','normal','dim')[$color]], 0, $display.ChapString)
                 }
-                $i++
             }
             return
         }
@@ -981,8 +977,8 @@ function printEntry($entry) {
             $tracks = $meta.closest('Segment').Tracks.TrackEntry
             $host.UI.write($colors.container, 0, "${indent}Tags ")
 
-            $targets = $entry.Targets['TagTrackUID'] | %{ $comma = '' } {
-                $UID = $_
+            $comma = ''
+            forEach ($UID in $entry.Targets['TagTrackUID']) {
                 if ($track = $tracks.where({ $_.TrackUID -eq $UID }, 'first')) {
                     $host.UI.write($colors.normal, 0,
                         $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
