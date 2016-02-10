@@ -308,7 +308,12 @@ function readChildren($container) {
             }
         }
     }
-
+    # make single container's properties directly enumerable
+    # thus allowing to type $mkv.Segment.Info.SegmentUID without [0]'s
+    $singleParent = $container._.parent[$container._.name]
+    if ($singleParent.count -eq 1) {
+        add-member ([ordered]@{} + $container) -inputObject $singleParent
+    }
     if ($opt.print -and !$state.abort -and !$state.print['postponed']) {
         printChildren $container
     }
