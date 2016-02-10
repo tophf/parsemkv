@@ -210,7 +210,7 @@ function parseMKV(
             $state.abort = $true;
             break
         }
-        if ($print) {
+        if ($opt.print) {
             printEntry $container
         }
 
@@ -835,7 +835,7 @@ function printEntry($entry) {
 
     $indent = '  '*$meta.level
 
-    if (!$printRaw) {
+    if (!$opt.printRaw) {
       switch -regex ($meta.path) {
         '^/Segment/$' {
             if (($i = $meta.parent.Segment.count) -gt 1) {
