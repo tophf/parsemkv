@@ -293,7 +293,7 @@ function readChildren($container) {
             # don't jump looking for tags if the segment is still empty
             # (quite probably the user just skips some sections like SeekHead)
             if ($meta.root.count -and !$state['exhaustiveSearch']) {
-                if ($opt.tags -ne 'skip' -and (locateTagsBlock $child)) {
+                if ($opt.tags -ne 'skip' -and (locateTagsBlock)) {
                     $lastContainerServed = $true
                     continue
                 }
@@ -558,14 +558,14 @@ function readEntry($container) {
     $meta
 }
 
-function locateTagsBlock($current) {
-    $seg = $current._.closest('Segment')
+function locateTagsBlock {
+    $seg = $meta.closest('Segment')
     [uint64]$end = $seg._.datapos + $seg._.size
 
     $maxBackSteps = 4096
     $stepSize = $lookupChunkSize
 
-    if ($stream.position + 16*$current._.size + $maxBackSteps*$stepSize -gt $end) {
+    if ($stream.position + 16*$meta.size + $maxBackSteps*$stepSize -gt $end) {
         # do nothing if the stream's end is near
         return
     }
@@ -578,7 +578,7 @@ function locateTagsBlock($current) {
 
     forEach ($step in 1..$maxBackSteps) {
         $stream.position = $start = $end - $stepSize*$step
-        $buf = $bin.readBytes($stepSize + 8*2) # current code supports max 8-byte id and size
+        $buf = $bin.readBytes($stepSize + 8*2) # max 8-byte id and size
         $haystack = [BitConverter]::toString($buf)
 
         # try locating Tags first but in case the last section is
@@ -620,7 +620,7 @@ function locateTagsBlock($current) {
             }
         }
     }
-    $stream.position = $current._.datapos + $current._.size
+    $stream.position = $meta.datapos + $meta.size
 }
 
 #endregion
