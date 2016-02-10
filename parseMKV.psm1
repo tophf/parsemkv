@@ -104,7 +104,7 @@ set-strictMode -version 4
 #>
 
 function parseMKV(
-        [string] [validateScript({ if (test-path -literal $_) { $true }
+        [string] [validateScript({ if ((test-path -literal $_) -or (test-path $_)) { $true }
                                    else { write-warning 'File not found'; throw } })]
     $filepath,
 
@@ -144,6 +144,9 @@ function parseMKV(
         [scriptblock]
     $entryCallback
 ) {
+    if (!(test-path -literal $filepath)) {
+        $filepath = (gi $filepath).fullName
+    }
     try {
         $stream = [IO.FileStream]::new(
             $filepath,
@@ -539,7 +542,6 @@ function readEntry($container) {
     }
     $stream.position = $meta.datapos + $size
 
-    #inlining for speed: addNamedChild $container $key $entry
     $key = $meta.name
     $existing = $container[$key]
     if ($existing -eq $null) {
@@ -550,7 +552,7 @@ function readEntry($container) {
         }
     } elseif ($existing -is [Collections.ArrayList]) {
         $existing.add($meta.ref) >$null
-    } else { # this should happen according to DTD
+    } else { # should never happen according to DTD but just in case
         $container[$key] = [Collections.ArrayList] @($existing, $meta.ref)
     }
     $meta
