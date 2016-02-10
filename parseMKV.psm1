@@ -114,7 +114,7 @@ function parseMKV(
 
         [string] [validateScript({ try { if ('' -match $_ -or $true) { $true } }
                                    catch { write-warning 'Bad regex'; throw $_ } })]
-    $skip = '^/Segment/(Cluster|Cue)', <# checked only after -stopOn #>
+    $skip = '^/Segment/(SeekHead|Cluster|Cue)', <# checked only after -stopOn #>
 
         [string] [validateSet('skip','read-when-printing','read','exhaustive-search')]
     $tags = 'read-when-printing',
@@ -181,8 +181,11 @@ function parseMKV(
         printFilter = $printFilter
         entryCallback = $entryCallback
     }
-    if ($tags -eq 'skip' -or ($tags -eq 'read-when-printing' -and !$opt.print)) {
-        $skip += '|/Tags/'
+    if (!$opt.print -and $opt.tags -eq 'read-when-printing') {
+        $opt.tags = 'skip'
+    }
+    if (!$opt.print -and $opt.tags -in 'skip','read-when-printing') {
+        $opt.skip += '|/Tags/'
     }
 
     $mkv = $dummyMeta.PSObject.copy()
@@ -254,6 +257,7 @@ function findNextRootContainer {
 function readChildren($container) {
     $stream.position = $container._.datapos
     $stopAt = $container._.datapos + $container._.size
+    $lastContainerServed = $false
 
     while ($stream.position -lt $stopAt -and !$state.abort) {
 
@@ -285,9 +289,12 @@ function readChildren($container) {
                 $state.print.postponed = $false
             }
             continue
-        } else {
-            if (!$state['exhaustiveSearch']) {
+        } elseif (!$lastContainerServed) {
+            # don't jump looking for tags if the segment is still empty
+            # (quite probably the user just skips some sections like SeekHead)
+            if ($meta.root.count -and !$state['exhaustiveSearch']) {
                 if ($opt.tags -ne 'skip' -and (locateTagsBlock $child)) {
+                    $lastContainerServed = $true
                     continue
                 }
                 if ($opt.tags -ne 'exhaustive-search') {
@@ -297,14 +304,7 @@ function readChildren($container) {
                 $state.exhaustiveSearch = $true
             }
             if ($opt.print) {
-                $silentSeconds = ([datetime]::now.ticks - $state.print.tick)/10000000
-                if ($silentSeconds -gt 0.3) {
-                    $done = $meta.pos / $stream.length
-                    $state.print.progress = "Skipping $($meta.name) elements"
-                    write-progress $state.print.progress `
-                        -percentComplete ($done * 100) `
-                        -secondsRemaining ($silentSeconds / $done - $silentSeconds + 1)
-                }
+                showProgressIfStuck
             }
         }
     }
@@ -570,13 +570,11 @@ function locateTagsBlock($current) {
         return
     }
     $vint = [byte[]]::new(8)
-    $IDs = 'Tags','SeekPosition','Cluster','Cues' | %{
+    $IDs = 'Tags','SeekHead','Cluster','Cues' | %{
         $IDhex = $DTD.__names[$_].id.toString('X')
         if ($IDhex.length -band 1) { $IDhex = '0' + $IDhex }
         ($IDhex -replace '..', '-$0').substring(1)
     }
-    # some [old?] mkvs have a zero-sized Cluster with SeekPosition at the end
-    $IDs[1] = $IDs[2] + '-' + $IDs[1]
 
     forEach ($step in 1..$maxBackSteps) {
         $stream.position = $start = $end - $stepSize*$step
@@ -598,16 +596,19 @@ function locateTagsBlock($current) {
                 $sizepos = $idpos + $idlen
                 $first = $buf[$sizepos]
                 if ($first -eq 0 -or $first -eq 0xFF) {
-                    break
+                    continue
                 } else {
                     $sizelen = 8 - [byte][Math]::floor([Math]::log($first)/[Math]::log(2))
+                    if ($sizepos + $sizelen -ge $buf.length) {
+                        continue
+                    }
                     $first = $first -band -bnot (1 -shl (8-$sizelen))
                     $size = if ($sizelen -eq 1) {
                             $first
                         } else {
                             $vint.clear()
                             $vint[0] = $first
-                            [Buffer]::BlockCopy($buf, $sizepos+1, $vint, 1, $sizelen-1)
+                            [Buffer]::blockCopy($buf, $sizepos+1, $vint, 1, $sizelen-1)
                             [Array]::reverse($vint, 0, $sizelen)
                             [BitConverter]::ToUInt64($vint, 0)
                         }
@@ -796,10 +797,12 @@ function printEntry($entry) {
     }
     if ($opt.printFilter -is [string]) {
         if (!($meta.path -match $opt.printFilter)) {
+            showProgressIfStuck
             return
         }
     } elseif ($opt.printFilter -is [scriptblock]) {
         if (!(& $opt.printFilter $entry)) {
+            showProgressIfStuck
             return
         }
     }
@@ -1003,6 +1006,34 @@ function printEntry($entry) {
     $color = if ($meta.name -match 'UID$') { 'dim' }
              else { switch ($meta.type) { string { 'string' } binary { 'dim' } default { 'value' } } }
     $host.UI.write($colors[$color], 0, $s)
+}
+
+function showProgressIfStuck {
+    $tick = [datetime]::now.ticks
+    <# after 0.5sec of silence #>
+    if ($tick - $state.print.tick -lt 5000000 `
+    <# update slider every 0.1sec #> `
+    -or $tick - $state.print['progresstick'] -lt 1000000) {
+        return
+    }
+    $state.print.progresstick = $tick
+    $done = $meta.pos / $stream.length
+    <# and update remaining time every 1sec #>
+    if (!$state.print['progress'] -or $tick - $state.print['progressmsgtick'] -ge 10000000) {
+        $silentSeconds = ($tick - $state.print.tick)/10000000
+        $remain = $silentSeconds / $done - $silentSeconds + 0.5
+        <# smooth-average the remaining time #>
+        $state.print.progressremain =
+            if (!$state.print['progress']) { $remain }
+            else { ($state.print.progressremain + $remain) / 2 }
+        $action = @('Reading silently', 'Skipping')[!!$meta['skipped']]
+        <# show top-level section name to avoid flicker of alternate subcontainers #>
+        $state.print.progress = "$action $($meta.path -replace '^/\w+/(\w+).*','$1') elements..."
+        $state.print.progressmsgtick = $tick
+    }
+    write-progress $state.print.progress `
+        -percentComplete ($done * 100) `
+        -secondsRemaining $state.print.progressremain
 }
 
 #endregion
