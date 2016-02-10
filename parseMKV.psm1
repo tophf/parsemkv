@@ -343,7 +343,8 @@ function readEntry($container) {
 
     $buf = [byte[]]::new(8)
     $buf[0] = $_ = $bin.readByte()
-    $meta.id = if ($_ -eq 0 -or $_ -eq 0xFF) {
+    $meta.id =
+        if ($_ -eq 0 -or $_ -eq 0xFF) {
             -1
         } else {
             $len = 8 - [byte][Math]::floor([Math]::log($_)/[Math]::log(2))
@@ -380,7 +381,8 @@ function readEntry($container) {
 
     $meta.path = $container._.path + $meta.name + '/'*[int]($meta.type -eq 'container')
 
-    $meta.size = $size = if ($info -and $info.contains('size')) {
+    $meta.size = $size =
+        if ($info -and $info.contains('size')) {
             $info.size
         } else {
             $buf.clear()
@@ -508,7 +510,7 @@ function readEntry($container) {
                 'uint'      { $value = 0 }
                 'float'     { $value = 0.0 }
                 'string'    { $value = '' }
-                'binary'    { [byte[]]::new(0) }
+                'binary'    { $value = [byte[]]::new(0) }
             }
         }
 
