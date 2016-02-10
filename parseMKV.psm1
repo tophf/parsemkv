@@ -184,7 +184,7 @@ function parseMKV(
 
     $mkv = $dummyMeta.PSObject.copy()
     $mkv.PSObject.members.remove('closest')
-    $mkv | add-member ([ordered]@{ type='container'; path='/'; ref=$mkv; _=$mkv})
+    $mkv | add-member ([ordered]@{ path='/'; ref=$mkv; _=$mkv})
     $mkv.EBML = [Collections.ArrayList]@()
     $mkv.Segment = [Collections.ArrayList]@()
 
@@ -199,7 +199,6 @@ function parseMKV(
         $container = $meta.root = $meta.ref
         $meta.level = 0
         $meta.root = $container
-        $meta.remove('parent')
 
         if ($entryCallback -and (& $entryCallback $container) -eq 'abort') {
             $state.abort = $true;
@@ -471,12 +470,6 @@ function readEntry($container) {
                         $value = [byte[]]::new(0)
                     }
                 }
-                'container' {
-                    $result = $value = [ordered]@{}
-                }
-                default {
-                    $value = @{}
-                }
             }
         } elseif ($info.contains('value')) {
             $value = $info.value
@@ -486,8 +479,7 @@ function readEntry($container) {
                 'uint'      { $value = 0 }
                 'float'     { $value = 0.0 }
                 'string'    { $value = '' }
-                'container' { $value = [ordered]@{} }
-                default     { $value = @{} }
+                'binary'    { [byte[]]::new(0) }
             }
         }
 
@@ -749,10 +741,7 @@ function printEntry($entry) {
 
     function printSimpleTags($entry) {
         $statsDelim = '  '*($entry._.level+1)
-
-        $simpletags = if ($entry.SimpleTag -is [Collections.ArrayList]) { $entry.SimpleTag }
-                        else { @($entry.SimpleTag) }
-        forEach ($stag in $simpletags) {
+        forEach ($stag in $entry.SimpleTag) {
             if ($stag.TagName.startsWith('_STATISTICS_')) {
                 continue
             }
@@ -839,16 +828,22 @@ function printEntry($entry) {
     $last.tick = [datetime]::now.ticks
     $last.emptyBinary = $emptyBinary
 
+    $indent = '  '*$meta.level
+
     if (!$printRaw) {
       switch -regex ($meta.path) {
+        '^/Segment/$' {
+            if (($i = $meta.parent.Segment.count) -gt 1) {
+                $host.UI.write($colors.container, 0, "${indent}Segment #$i")
+            }
+        }
         '/TrackEntry/$' {
             $type = $entry.TrackType
             $flags = if ($entry['FlagForced'] -eq 1) { '!' } else { '' }
             $flags += if ($entry['FlagDefault'] -eq 1) { '*' }
             $flags += if ($entry['FlagEnabled'] -eq 0) { '-' }
 
-            $host.UI.write($colors.container, 0, ('  '*$entry._.level) +
-                $type + ' ' + ($flags -replace '.$','$0 '))
+            $host.UI.write($colors.container, 0, "$indent$type $($flags -replace '.$','$0 ')")
             $host.UI.write($colors.normal, 0, $entry.CodecID + ' ')
 
             $s = $alt = ''
@@ -879,14 +874,14 @@ function printEntry($entry) {
                     $host.UI.write($colors.value, 0, $fps)
                 }
                 'Audio' {
-                    $ch = $entry._.find('Channels')
+                    $ch = $meta.find('Channels')
                     if ($ch) { $s += "${ch}ch " }
 
-                    $hz = $entry._.find('SamplingFrequency')
-                    $hzOut = $entry._.find('OutputSamplingFrequency'); if (!$hzOut) { $hzOut = $hz }
+                    $hz = $meta.find('SamplingFrequency')
+                    $hzOut = $meta.find('OutputSamplingFrequency'); if (!$hzOut) { $hzOut = $hz }
                     if ($hzOut) { $s += ($hzOut/1000).toString($numberFormat) + 'kHz ' }
                     if ($hzOut -and $hzOut -ne $hz) { $s += '(SBR) ' }
-                    $bits = $entry._.find('BitDepth')
+                    $bits = $meta.find('BitDepth')
                     if ($bits) { $s += "${bits}bit " }
                     $host.UI.write($colors.value, 0, $s)
                 }
@@ -910,7 +905,7 @@ function printEntry($entry) {
             $flags += if ($hidden) { '-' }
             $color = (1-$enabled) + 2*$hidden
             $host.UI.write($colors[@('container','normal','dim')[$color]], 0,
-                ('  '*$entry._.level) + 'Chapter ')
+                "${indent}Chapter ")
             $host.UI.write($colors[@('normal','normal','dim')[$color]], 0,
                 $entry.ChapterTimeStart._.displayString + ' ')
             $host.UI.write($colors.dim, 0,
@@ -935,7 +930,7 @@ function printEntry($entry) {
             $flags = 'Ordered','Default','Hidden' | %{
                 @('',$_.toLower())[[int]($entry["EditionFlag$_"] -eq 1)]
             }
-            $host.UI.write($colors.container, 0, ('  '*$meta.level) + 'Edition ')
+            $host.UI.write($colors.container, 0, "${indent}Edition ")
             if (($flags -join '')) {
                 $host.UI.write($colors.value, 0, $flags)
             }
@@ -953,27 +948,18 @@ function printEntry($entry) {
         }
         '/Tag/$' {
             $tracks = $meta.closest('Segment').Tracks.TrackEntry
-            if ($tracks -isnot [Collections.ArrayList]) { $tracks = @($tracks) }
-            $host.UI.write($colors.container, 0, ('  '*$meta.level) + 'Tags ')
+            $host.UI.write($colors.container, 0, "${indent}Tags ")
 
-            if ($entry.Targets -is [Collections.ArrayList]) {
-                $targets = $entry.Targets
-            } else {
-                $targets = @($entry.Targets)
-            }
-            $targets = $targets | %{ $comma = '' } {
-                if ($UID = $_['TagTrackUID']) {
-                    $track = $tracks.where({ $_.TrackUID -eq $UID }, 'first')
-                    if ($track) {
-                        $track = $track[0]
-                        $host.UI.write($colors.normal, 0,
-                            $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
-                        if ($track['Name']) {
-                            $host.UI.write($colors.reference, 0, ' (' + $track.Name + ')')
-                        }
+            $targets = $entry.Targets['TagTrackUID'] | %{ $comma = '' } {
+                $UID = $_
+                if ($track = $tracks.where({ $_.TrackUID -eq $UID }, 'first')) {
+                    $host.UI.write($colors.normal, 0,
+                        $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
+                    if ($track[0]['Name']) {
+                        $host.UI.write($colors.reference, 0, " ($($track.Name))")
                     }
-                    $comma = ', '
                 }
+                $comma = ', '
             }
             $host.UI.writeLine()
 
@@ -1000,7 +986,7 @@ function printEntry($entry) {
     }
 
     $color = if ($meta.type -eq 'container') { 'container' } else { 'normal' }
-    $host.UI.write($colors[$color], 0, ('  '*$meta.level) + $meta.name + ' ')
+    $host.UI.write($colors[$color], 0, "$indent$($meta.name) ")
 
     $s = if ($meta.contains('displayString')) {
         $meta.displayString
@@ -1065,42 +1051,52 @@ function init {
 
     $script:dummyMeta = @{}
 
-    add-member scriptMethod closest { param([string]$name, [string]$match)
-        # find the closest parent matching 'name' or 'match' regexp ('name' takes precedence)
-        $e = $this.ref
-        do {
-            if (($name -and $e._.name -eq $name) `
-            -or ($match -and $e._.name -match $match)) {
-                return $e
+    add-member scriptMethod closest {
+        # finds the closest parent
+        param(
+            [string]$name='', # name string, case-insensitive, takes precedence over 'match'
+            [string]$match='' # path regexp, case-insensitive
+        )
+        for ($m = $this; $m['name']; $m = $m.parent._) {
+            if (($name -and $m.name -eq $name) `
+            -or ($match -and $m.path -match $match)) {
+                return $m.ref
             }
-            $e = $e._['parent']
-        } until ($e -eq $null)
+        }
     } -inputObject $dummyMeta
 
-    add-member scriptMethod find { param([string]$name, [string]$match)
-        # find all nested children matching 'name' or 'match' regexp ('name' takes precedence)
-        # returns: $null, a single object or Collection`1
-        $results = {}.invoke()
-        if ($this.type -ne 'container') {
-            return $results
+    add-member scriptMethod find {
+        # finds all nested children
+        # returns: $null, a single object of primitive type or an array of 1 or more entries
+        param(
+            [string]$name='', # name string, case-insensitive, takes precedence over 'match'
+            [string]$match='' # path regexp, case-insensitive
+        )
+        if ($this.ref -isnot [hashtable]) {
+            return
         }
-        $checked = @{}
+        $results = [ordered]@{}
         forEach ($child in $this.ref.getEnumerator()) {
             forEach ($meta in $child.value._) {
                 if (($name -and $meta.name -eq $name) `
                 -or ($match -and $meta.path -match $match)) {
-                    $hash = [Runtime.CompilerServices.RuntimeHelpers]::getHashCode($meta.ref)
-                    if (!$checked[$hash]) {
-                        $checked[$hash] = $true
-                        $results.add($meta.ref)
+                    $hash = '' + [Runtime.CompilerServices.RuntimeHelpers]::getHashCode($meta.ref)
+                    if (!$results.contains($hash)) {
+                        $results[$hash] = $meta.ref
                     }
                 }
                 if ($meta.type -eq 'container') {
-                    forEach ($r in $meta.find($name,$match)) { $results.add($r) }
+                    forEach ($r in $meta.find($name,$match,0xDEADBEEF).getEnumerator()) {
+                        $results[$r.name] = $r.value
+                    }
                 }
             }
         }
-        $results
+        if ($args -eq 0xDEADBEEF) { $results }
+        elseif ($results.count -eq 0) { $null }
+        elseif ($results.count -gt 1) { $results.values }
+        elseif ($results.values[0]._.type -in 'binary','container') { ,$results.values[0] }
+        else { $results.values[0] }
     } -inputObject $dummyMeta
 
     $script:dummyContainer = add-member _ $dummyMeta -inputObject (@{}) -passthru
