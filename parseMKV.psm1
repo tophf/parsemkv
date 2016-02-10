@@ -168,7 +168,7 @@ function parseMKV(
     $state = @{
         abort = $false # set when entryCallback returns 'abort'
         print = @{ tick=[datetime]::now.ticks }
-        timecodeScale = $DTD.__names.TimecodeScale.value
+        timecodeScale = $DTD.Segment.Info.TimecodeScale._.value
     }
     # less ambiguous local alias
     $opt = @{
@@ -190,7 +190,7 @@ function parseMKV(
 
     $mkv = $dummyMeta.PSObject.copy()
     $mkv.PSObject.members.remove('closest')
-    $mkv | add-member ([ordered]@{ path='/'; ref=$mkv; _=$mkv})
+    $mkv | add-member ([ordered]@{ path='/'; ref=$mkv; _=$mkv; DTD=$DTD})
     $mkv.EBML = [Collections.ArrayList]@()
     $mkv.Segment = [Collections.ArrayList]@()
 
@@ -356,10 +356,26 @@ function readEntry($container) {
             }
         }
 
-    $info = $DTD.__IDs['{0:x}' -f $meta.id]
+    $idhex = '{0:x}' -f $meta.id
+    if (!($info = $DTD._.globalIDs[$idhex])) {
+        $info = $DTD
+        $subpath = $container._.path.substring(1)
+        while ($subpath) {
+            $s, $subpath = $subpath -split '/', 2
+            $info = $info[$s]
+        }
+        $info = $info._.IDs[$idhex]
+    }
+    if ($info) {
+        $info = $info._
+        $meta.name = $info.name
+        $meta.type = $info.type
+    } else {
+        $meta.name = '?'
+        $meta.type = 'binary'
+        $info = @{}
+    }
 
-    $meta.name = if ($info) { $info.name } else { '?' }
-    $meta.type = if ($info) { $info.type } else { '' }
     $meta.path = $container._.path + $meta.name + '/'*[int]($meta.type -eq 'container')
 
     $meta.size = $size = if ($info -and $info.contains('size')) {
@@ -468,6 +484,14 @@ function readEntry($container) {
                         $value = $bin.ReadBytes($readSize)
                         if ($meta.name -cmatch '\wUID$') {
                             $meta.displayString = bin2hex $value
+                        } elseif ($meta.name -eq '?') {
+                            $s = [Text.Encoding]::UTF8.getString($value)
+                            if ($s -cmatch '^[\x20-\x7F]+$') {
+                                $meta.displayString = 
+                                    [BitConverter]::toString($value, 0, [Math]::min(16,$value.length)) +
+                                    @('','...')[[int]($readSize -gt 16)] + 
+                                    " possible ASCII string: $s"
+                            }
                         }
                     } else {
                         $value = [byte[]]::new(0)
@@ -486,7 +510,7 @@ function readEntry($container) {
             }
         }
 
-        $typecast = switch ($info.type) {
+        $typecast = switch ($meta.type) {
             'int'  { if ($size -le 4) { [int32] } else { [int64] } }
             'uint' { if ($size -le 4) { [uint32] } else { [uint64] } }
             'float' { if ($size -eq 4) { [single] } else { [double] } }
@@ -520,7 +544,7 @@ function readEntry($container) {
                 $result = bakeTime -ms:$true -fps:$true -noScaling
             }
             '/TrackEntry/TrackType$' {
-                if ($value = $DTD.__TrackTypes[[int]$result]) {
+                if ($value = $DTD._.trackTypes[[int]$result]) {
                     $meta.rawValue = $result
                     $result = $value
                     $tracks = $container._.parent
@@ -571,7 +595,7 @@ function locateTagsBlock {
     }
     $vint = [byte[]]::new(8)
     $IDs = 'Tags','SeekHead','Cluster','Cues' | %{
-        $IDhex = $DTD.__names[$_].id.toString('X')
+        $IDhex = $DTD.Segment[$_]._.id.toString('X')
         if ($IDhex.length -band 1) { $IDhex = '0' + $IDhex }
         ($IDhex -replace '..', '-$0').substring(1)
     }
@@ -839,7 +863,7 @@ function printEntry($entry) {
       switch -regex ($meta.path) {
         '^/Segment/$' {
             if (($i = $meta.parent.Segment.count) -gt 1) {
-                $host.UI.write($colors.container, 0, "${indent}Segment #$i")
+                $host.UI.write($colors.container, 0, "`n${indent}Segment #$i")
             }
         }
         '/TrackEntry/$' {
@@ -892,7 +916,7 @@ function printEntry($entry) {
                 }
             }
             $lng = "$($entry['Language'])" -replace 'und',''
-            if (!$lng) { $lng = $DTD.__names.TrackEntry.children.Language.value }
+            if (!$lng) { $lng = $DTD.Segment.Tracks.TrackEntry.Language._.value }
             $name = $entry['Name']
             if ($lng) {
                 $host.UI.write($colors.bold, 0, $lng)
@@ -920,7 +944,7 @@ function printEntry($entry) {
                     $host.UI.write($colors.dim, 0, ' ')
                 }
                 $lng = $_['ChapLanguage']
-                if (!$lng) { $lng = $DTD.__names.ChapLanguage.value }
+                if (!$lng) { $lng = $DTD.Segment.Chapters.ChapterDisplay.ChapLanguage._.value }
                 if ($lng -and $lng -ne 'und') {
                     $host.UI.write($colors.dim, 0, $lng.trim() + '/')
                 }
@@ -975,7 +999,7 @@ function printEntry($entry) {
             return
         }
         '/Info/(DateUTC|(Muxing|Writing)App)$' {
-            if ($meta.parent.MuxingApp -eq 'no_variable_data') {
+            if ($meta.parent['MuxingApp'] -eq 'no_variable_data') {
                 $last.omitLineFeed = $true
                 return
             }
@@ -1041,20 +1065,24 @@ function showProgressIfStuck {
 
 function init {
 
-    function flattenDTD([hashtable]$dict, [bool]$byID, [hashtable]$flat=@{}) {
-        $dict.getEnumerator().forEach({
-            $v = $_.value
-            if ($byID) {
-                $flat['{0:x}' -f $v.id] = $v
-                $v.name = $_.key
-            } else {
-                $flat[$_.key] = $v
-            }
-            if ($v.contains('children')) {
-                $flat = flattenDTD $v.children $byID $flat
+    function addReverseMapping([hashtable]$container) {
+        $container._.IDs = @{}
+        $container.getEnumerator().forEach({
+            if ($_.key -ne '_') {
+                $v = $_.value
+                $v._.name = $_.key
+                $id = '{0:x}' -f $v._.id
+                $container._.IDs[$id] = $v
+
+                if ($v._['global']) {
+                    $DTD._.globalIDs[$id] = $v
+                }
+
+                if ($v.count -gt 1) {
+                    addReverseMapping $v
+                }
             }
         })
-        $flat
     }
 
     # postpone printing these small sections until all contained info is known
@@ -1149,319 +1177,319 @@ function init {
     }
 
     $script:DTD = @{
-        EBML = @{ id=0x1a45dfa3; type='container'; multiple=$true; children = @{
-            EBMLVersion = @{ id=0x4286; type='uint'; value=1 }
-            EBMLReadVersion = @{ id=0x42f7; type='uint'; value=1 }
-            EBMLMaxIDLength = @{ id=0x42f2; type='uint'; value=4 }
-            EBMLMaxSizeLength = @{ id=0x42f3; type='uint'; value=8 }
-            DocType = @{ id=0x4282; type='string' }
-            DocTypeVersion = @{ id=0x4287; type='uint'; value=1 }
-            DocTypeReadVersion = @{ id=0x4285; type='uint'; value=1 }
-        }}
-        CRC32 = @{ id=0xbf; type='binary' }
-        Void = @{ id=0xec; type='binary'; multiple=$true }
-        Dummy = @{ id=0xff; type='binary'; multiple=$true }
-        SignatureSlot = @{ id=0x1b538667; type='container'; multiple=$true; children = @{
-            SignatureAlgo = @{ id=0x7e8a; type='uint' }
-            SignatureHash = @{ id=0x7e9a; type='uint' }
-            SignaturePublicKey = @{ id=0x7ea5; type='binary' }
-            Signature = @{ id=0x7eb5; type='binary' }
-            SignatureElements = @{ id=0x7e5b; type='container'; children = @{
-                SignatureElementList = @{ id=0x7e7b; type='container'; multiple=$true; children = @{
-                    SignedElement = @{ id=0x6532; type='binary'; multiple=$true }
-                }}
-            }}
-        }}
+        _=@{
+            globalIDs = @{}
+            trackTypes = @{
+                   1 = 'Video'
+                   2 = 'Audio'
+                0x10 = 'Logo'
+                0x11 = 'Subtitle'
+                0x12 = 'Buttons'
+                0x20 = 'Control'
+            }
+        }
+
+        CRC32 = @{ _=@{ id=0xbf; type='binary'; global=$true } }
+        Void = @{ _=@{ id=0xec; type='binary'; global=$true; multiple=$true } }
+        SignatureSlot = @{ _=@{ id=0x1b538667; type='container'; global=$true; multiple=$true }
+            SignatureAlgo = @{ _=@{ id=0x7e8a; type='uint' } }
+            SignatureHash = @{ _=@{ id=0x7e9a; type='uint' } }
+            SignaturePublicKey = @{ _=@{ id=0x7ea5; type='binary' } }
+            Signature = @{ _=@{ id=0x7eb5; type='binary' } }
+            SignatureElements = @{ _=@{ id=0x7e5b; type='container' }
+                SignatureElementList = @{ _=@{ id=0x7e7b; type='container'; multiple=$true }
+                    SignedElement = @{ _=@{ id=0x6532; type='binary'; multiple=$true } }
+                }
+            }
+        }
+
+        EBML = @{ _=@{ id=0x1a45dfa3; type='container'; multiple=$true }
+            EBMLVersion = @{ _=@{ id=0x4286; type='uint'; value=1 } }
+            EBMLReadVersion = @{ _=@{ id=0x42f7; type='uint'; value=1 } }
+            EBMLMaxIDLength = @{ _=@{ id=0x42f2; type='uint'; value=4 } }
+            EBMLMaxSizeLength = @{ _=@{ id=0x42f3; type='uint'; value=8 } }
+            DocType = @{ _=@{ id=0x4282; type='string' } }
+            DocTypeVersion = @{ _=@{ id=0x4287; type='uint'; value=1 } }
+            DocTypeReadVersion = @{ _=@{ id=0x4285; type='uint'; value=1 } }
+        }
 
         # Matroska DTD
-        Segment = @{ id=0x18538067; type='container'; multiple=$true; children = @{
+        Segment = @{ _=@{ id=0x18538067; type='container'; multiple=$true }
 
             # Meta Seek Information
-            SeekHead = @{ id=0x114d9b74; type='container'; multiple=$true; children = @{
-                Seek = @{ id=0x4dbb; type='container'; multiple=$true; children = @{
-                    SeekID = @{ id=0x53ab; type='binary' }
-                    SeekPosition = @{ id=0x53ac; type='uint' }
-                }}
-            }}
+            SeekHead = @{ _=@{ id=0x114d9b74; type='container'; multiple=$true }
+                Seek = @{ _=@{ id=0x4dbb; type='container'; multiple=$true }
+                    SeekID = @{ _=@{ id=0x53ab; type='binary' } }
+                    SeekPosition = @{ _=@{ id=0x53ac; type='uint' } }
+                }
+            }
 
             # Segment Information
-            Info = @{ id=0x1549a966; type='container'; multiple=$true; children = @{
-                SegmentUID = @{ id=0x73a4; type='binary' }
-                SegmentFilename = @{ id=0x7384; type='string' }
-                PrevUID = @{ id=0x3cb923; type='binary' }
-                PrevFilename = @{ id=0x3c83ab; type='string' }
-                NextUID = @{ id=0x3eb923; type='binary' }
-                NextFilename = @{ id=0x3e83bb; type='string' }
-                SegmentFamily = @{ id=0x4444; type='binary'; multiple=$true }
-                ChapterTranslate = @{ id=0x6924; type='container'; multiple=$true; children = @{
-                    ChapterTranslateEditionUID = @{ id=0x69fc; type='uint'; multiple=$true }
-                    ChapterTranslateCodec = @{ id=0x69bf; type='uint' }
-                    ChapterTranslateID = @{ id=0x69a5; type='binary' }
-                }}
-                TimecodeScale = @{ id=0x2ad7b1; type='uint'; value=1000000 }
-                Duration = @{ id=0x4489; type='float' }
-                DateUTC = @{ id=0x4461; type='date' }
-                Title = @{ id=0x7ba9; type='string' }
-                MuxingApp = @{ id=0x4d80; type='string' }
-                WritingApp = @{ id=0x5741; type='string' }
-            }}
+            Info = @{ _=@{ id=0x1549a966; type='container'; multiple=$true }
+                SegmentUID = @{ _=@{ id=0x73a4; type='binary' } }
+                SegmentFilename = @{ _=@{ id=0x7384; type='string' } }
+                PrevUID = @{ _=@{ id=0x3cb923; type='binary' } }
+                PrevFilename = @{ _=@{ id=0x3c83ab; type='string' } }
+                NextUID = @{ _=@{ id=0x3eb923; type='binary' } }
+                NextFilename = @{ _=@{ id=0x3e83bb; type='string' } }
+                SegmentFamily = @{ _=@{ id=0x4444; type='binary'; multiple=$true } }
+                ChapterTranslate = @{ _=@{ id=0x6924; type='container'; multiple=$true }
+                    ChapterTranslateEditionUID = @{ _=@{ id=0x69fc; type='uint'; multiple=$true } }
+                    ChapterTranslateCodec = @{ _=@{ id=0x69bf; type='uint' } }
+                    ChapterTranslateID = @{ _=@{ id=0x69a5; type='binary' } }
+                }
+                TimecodeScale = @{ _=@{ id=0x2ad7b1; type='uint'; value=1000000 } }
+                Duration = @{ _=@{ id=0x4489; type='float' } }
+                DateUTC = @{ _=@{ id=0x4461; type='date' } }
+                Title = @{ _=@{ id=0x7ba9; type='string' } }
+                MuxingApp = @{ _=@{ id=0x4d80; type='string' } }
+                WritingApp = @{ _=@{ id=0x5741; type='string' } }
+            }
 
             # Cluster
-            Cluster = @{ id=0x1f43b675; type='container'; multiple=$true; children = @{
-                Timecode = @{ id=0xe7; type='uint' }
-                SilentTracks = @{ id=0x5854; type='container'; children = @{
-                    SilentTrackNumber = @{ id=0x58d7; type='uint'; multiple=$true }
-                }}
-                Position = @{ id=0xa7; type='uint' }
-                PrevSize = @{ id=0xab; type='uint' }
-                SimpleBlock = @{ id=0xa3; type='binary'; multiple=$true }
-                BlockGroup = @{ id=0xa0; type='container'; multiple=$true; children = @{
-                    Block = @{ id=0xa1; type='binary' }
-                    BlockVirtual = @{ id=0xa2; type='binary' }
-                    BlockAdditions = @{ id=0x75a1; type='container'; children = @{
-                        BlockMore = @{ id=0xa6; type='container'; multiple=$true; children = @{
-                            BlockAddID = @{ id=0xee; type='uint' }
-                            BlockAdditional = @{ id=0xa5; type='binary' }
-                        }}
-                    }}
-                    BlockDuration = @{ id=0x9b; type='uint' }
-                    ReferencePriority = @{ id=0xfa; type='uint' }
-                    ReferenceBlock = @{ id=0xfb; type='int'; multiple=$true }
-                    ReferenceVirtual = @{ id=0xfd; type='int' }
-                    CodecState = @{ id=0xa4; type='binary' }
-                    DiscardPadding = @{ id=0x75a2; type='int' }
-                    Slices = @{ id=0x8e; type='container'; children = @{
-                        TimeSlice = @{ id=0xe8; type='container'; multiple=$true; children = @{
-                            LaceNumber = @{ id=0xcc; type='uint'; value=0 }
-                            FrameNumber = @{ id=0xcd; type='uint'; value=0 }
-                            BlockAdditionID = @{ id=0xcb; type='uint'; value=0 }
-                            Delay = @{ id=0xce; type='uint'; value=0 }
-                            SliceDuration = @{ id=0xcf; type='uint' }
-                        }}
-                    }}
-                    ReferenceFrame = @{ id=0xc8; type='container'; children = @{
-                        ReferenceOffset = @{ id=0xc9; type='uint'; value=0 }
-                        ReferenceTimeCode = @{ id=0xca; type='uint'; value=0 }
-                    }}
-                EncryptedBlock = @{ id=0xaf; type='binary'; multiple=$true }
-                }}
-            }}
+            Cluster = @{ _=@{ id=0x1f43b675; type='container'; multiple=$true }
+                Timecode = @{ _=@{ id=0xe7; type='uint' } }
+                SilentTracks = @{ _=@{ id=0x5854; type='container' }
+                    SilentTrackNumber = @{ _=@{ id=0x58d7; type='uint'; multiple=$true } }
+                }
+                Position = @{ _=@{ id=0xa7; type='uint' } }
+                PrevSize = @{ _=@{ id=0xab; type='uint' } }
+                SimpleBlock = @{ _=@{ id=0xa3; type='binary'; multiple=$true } }
+                BlockGroup = @{ _=@{ id=0xa0; type='container'; multiple=$true }
+                    Block = @{ _=@{ id=0xa1; type='binary' } }
+                    BlockVirtual = @{ _=@{ id=0xa2; type='binary' } }
+                    BlockAdditions = @{ _=@{ id=0x75a1; type='container' }
+                        BlockMore = @{ _=@{ id=0xa6; type='container'; multiple=$true }
+                            BlockAddID = @{ _=@{ id=0xee; type='uint' } }
+                            BlockAdditional = @{ _=@{ id=0xa5; type='binary' } }
+                        }
+                    }
+                    BlockDuration = @{ _=@{ id=0x9b; type='uint' } }
+                    ReferencePriority = @{ _=@{ id=0xfa; type='uint' } }
+                    ReferenceBlock = @{ _=@{ id=0xfb; type='int'; multiple=$true } }
+                    ReferenceVirtual = @{ _=@{ id=0xfd; type='int' } }
+                    CodecState = @{ _=@{ id=0xa4; type='binary' } }
+                    DiscardPadding = @{ _=@{ id=0x75a2; type='int' } }
+                    Slices = @{ _=@{ id=0x8e; type='container' }
+                        TimeSlice = @{ _=@{ id=0xe8; type='container'; multiple=$true }
+                            LaceNumber = @{ _=@{ id=0xcc; type='uint'; value=0 } }
+                            FrameNumber = @{ _=@{ id=0xcd; type='uint'; value=0 } }
+                            BlockAdditionID = @{ _=@{ id=0xcb; type='uint'; value=0 } }
+                            Delay = @{ _=@{ id=0xce; type='uint'; value=0 } }
+                            SliceDuration = @{ _=@{ id=0xcf; type='uint' } }
+                        }
+                    }
+                    ReferenceFrame = @{ _=@{ id=0xc8; type='container' }
+                        ReferenceOffset = @{ _=@{ id=0xc9; type='uint'; value=0 } }
+                        ReferenceTimeCode = @{ _=@{ id=0xca; type='uint'; value=0 } }
+                    }
+                EncryptedBlock = @{ _=@{ id=0xaf; type='binary'; multiple=$true } }
+                }
+            }
 
             # Track
-            Tracks = @{ id=0x1654ae6b; type='container'; multiple=$true; children = @{
-                TrackEntry = @{ id=0xae; type='container'; multiple=$true; children = @{
-                    TrackNumber = @{ id=0xd7; type='uint' }
-                    TrackUID = @{ id=0x73c5; type='uint' }
-                    TrackType = @{ id=0x83; type='uint' }
-                    FlagEnabled = @{ id=0xb9; type='uint'; value=1 }
-                    FlagDefault = @{ id=0x88; type='uint'; value=1 }
-                    FlagForced = @{ id=0x55aa; type='uint'; value=0 }
-                    FlagLacing = @{ id=0x9c; type='uint'; value=1 }
-                    MinCache = @{ id=0x6de7; type='uint'; value=0 }
-                    MaxCache = @{ id=0x6df8; type='uint' }
-                    DefaultDuration = @{ id=0x23e383; type='uint' }
-                    DefaultDecodedFieldDuration = @{ id=0x234e7a; type='uint' }
-                    TrackTimecodeScale = @{ id=0x23314f; type='float'; value=1.0 }
-                    TrackOffset = @{ id=0x537f; type='int'; value=0 }
-                    MaxBlockAdditionID = @{ id=0x55ee; type='uint'; value=0 }
-                    Name = @{ id=0x536e; type='string' }
-                    Language = @{ id=0x22b59c; type='string'; value='eng' }
-                    CodecID = @{ id=0x86; type='string' }
-                    CodecPrivate = @{ id=0x63a2; type='binary' }
-                    CodecName = @{ id=0x258688; type='string' }
-                    AttachmentLink = @{ id=0x7446; type='uint' }
-                    CodecSettings = @{ id=0x3a9697; type='string' }
-                    CodecInfoURL = @{ id=0x3b4040; type='string'; multiple=$true }
-                    CodecDownloadURL = @{ id=0x26b240; type='string'; multiple=$true }
-                    CodecDecodeAll = @{ id=0xaa; type='uint'; value=1 }
-                    TrackOverlay = @{ id=0x6fab; type='uint'; multiple=$true }
-                    CodecDelay = @{ id=0x56aa; type='uint' }
-                    SeekPreRoll = @{ id=0x56bb; type='uint' }
-                    TrackTranslate = @{ id=0x6624; type='container'; multiple=$true; children = @{
-                        TrackTranslateEditionUID = @{ id=0x66fc; type='uint'; multiple=$true }
-                        TrackTranslateCodec = @{ id=0x66bf; type='uint' }
-                        TrackTranslateTrackID = @{ id=0x66a5; type='binary' }
-                    }}
+            Tracks = @{ _=@{ id=0x1654ae6b; type='container'; multiple=$true }
+                TrackEntry = @{ _=@{ id=0xae; type='container'; multiple=$true }
+                    TrackNumber = @{ _=@{ id=0xd7; type='uint' } }
+                    TrackUID = @{ _=@{ id=0x73c5; type='uint' } }
+                    TrackType = @{ _=@{ id=0x83; type='uint' } }
+                    FlagEnabled = @{ _=@{ id=0xb9; type='uint'; value=1 } }
+                    FlagDefault = @{ _=@{ id=0x88; type='uint'; value=1 } }
+                    FlagForced = @{ _=@{ id=0x55aa; type='uint'; value=0 } }
+                    FlagLacing = @{ _=@{ id=0x9c; type='uint'; value=1 } }
+                    MinCache = @{ _=@{ id=0x6de7; type='uint'; value=0 } }
+                    MaxCache = @{ _=@{ id=0x6df8; type='uint' } }
+                    DefaultDuration = @{ _=@{ id=0x23e383; type='uint' } }
+                    DefaultDecodedFieldDuration = @{ _=@{ id=0x234e7a; type='uint' } }
+                    TrackTimecodeScale = @{ _=@{ id=0x23314f; type='float'; value=1.0 } }
+                    TrackOffset = @{ _=@{ id=0x537f; type='int'; value=0 } }
+                    MaxBlockAdditionID = @{ _=@{ id=0x55ee; type='uint'; value=0 } }
+                    Name = @{ _=@{ id=0x536e; type='string' } }
+                    Language = @{ _=@{ id=0x22b59c; type='string'; value='eng' } }
+                    CodecID = @{ _=@{ id=0x86; type='string' } }
+                    CodecPrivate = @{ _=@{ id=0x63a2; type='binary' } }
+                    CodecName = @{ _=@{ id=0x258688; type='string' } }
+                    AttachmentLink = @{ _=@{ id=0x7446; type='uint' } }
+                    CodecSettings = @{ _=@{ id=0x3a9697; type='string' } }
+                    CodecInfoURL = @{ _=@{ id=0x3b4040; type='string'; multiple=$true } }
+                    CodecDownloadURL = @{ _=@{ id=0x26b240; type='string'; multiple=$true } }
+                    CodecDecodeAll = @{ _=@{ id=0xaa; type='uint'; value=1 } }
+                    TrackOverlay = @{ _=@{ id=0x6fab; type='uint'; multiple=$true } }
+                    CodecDelay = @{ _=@{ id=0x56aa; type='uint' } }
+                    SeekPreRoll = @{ _=@{ id=0x56bb; type='uint' } }
+                    TrackTranslate = @{ _=@{ id=0x6624; type='container'; multiple=$true }
+                        TrackTranslateEditionUID = @{ _=@{ id=0x66fc; type='uint'; multiple=$true } }
+                        TrackTranslateCodec = @{ _=@{ id=0x66bf; type='uint' } }
+                        TrackTranslateTrackID = @{ _=@{ id=0x66a5; type='binary' } }
+                    }
 
                     # Video
-                    Video = @{ id=0xe0; type='container'; children = @{
-                        FlagInterlaced = @{ id=0x9a; type='uint'; value=0 }
-                        StereoMode = @{ id=0x53b8; type='uint'; value=0 }
-                        AlphaMode = @{ id=0x53c0; type='uint' }
-                        OldStereoMode = @{ id=0x53b9; type='uint' }
-                        PixelWidth = @{ id=0xb0; type='uint' }
-                        PixelHeight = @{ id=0xba; type='uint' }
-                        PixelCropBottom = @{ id=0x54aa; type='uint' }
-                        PixelCropTop = @{ id=0x54bb; type='uint' }
-                        PixelCropLeft = @{ id=0x54cc; type='uint' }
-                        PixelCropRight = @{ id=0x54dd; type='uint' }
-                        DisplayWidth = @{ id=0x54b0; type='uint' }
-                        DisplayHeight = @{ id=0x54ba; type='uint' }
-                        DisplayUnit = @{ id=0x54b2; type='uint'; value=0 }
-                        AspectRatioType = @{ id=0x54b3; type='uint'; value=0 }
-                        ColourSpace = @{ id=0x2eb524; type='binary' }
-                        GammaValue = @{ id=0x2fb523; type='float' }
-                        FrameRate = @{ id=0x2383e3; type='float' }
-                    }}
+                    Video = @{ _=@{ id=0xe0; type='container' }
+                        FlagInterlaced = @{ _=@{ id=0x9a; type='uint'; value=0 } }
+                        StereoMode = @{ _=@{ id=0x53b8; type='uint'; value=0 } }
+                        AlphaMode = @{ _=@{ id=0x53c0; type='uint' } }
+                        OldStereoMode = @{ _=@{ id=0x53b9; type='uint' } }
+                        PixelWidth = @{ _=@{ id=0xb0; type='uint' } }
+                        PixelHeight = @{ _=@{ id=0xba; type='uint' } }
+                        PixelCropBottom = @{ _=@{ id=0x54aa; type='uint' } }
+                        PixelCropTop = @{ _=@{ id=0x54bb; type='uint' } }
+                        PixelCropLeft = @{ _=@{ id=0x54cc; type='uint' } }
+                        PixelCropRight = @{ _=@{ id=0x54dd; type='uint' } }
+                        DisplayWidth = @{ _=@{ id=0x54b0; type='uint' } }
+                        DisplayHeight = @{ _=@{ id=0x54ba; type='uint' } }
+                        DisplayUnit = @{ _=@{ id=0x54b2; type='uint'; value=0 } }
+                        AspectRatioType = @{ _=@{ id=0x54b3; type='uint'; value=0 } }
+                        ColourSpace = @{ _=@{ id=0x2eb524; type='binary' } }
+                        GammaValue = @{ _=@{ id=0x2fb523; type='float' } }
+                        FrameRate = @{ _=@{ id=0x2383e3; type='float' } }
+                    }
 
                     # Audio
-                    Audio = @{ id=0xe1; type='container'; children = @{
-                        SamplingFrequency = @{ id=0xb5; type='float'; value=8000.0 }
-                        OutputSamplingFrequency = @{ id=0x78b5; type='float'; value=8000.0 }
-                        Channels = @{ id=0x9f; type='uint'; value=1 }
-                        ChannelPositions = @{ id=0x7d7b; type='binary' }
-                        BitDepth = @{ id=0x6264; type='uint' }
-                    }}
+                    Audio = @{ _=@{ id=0xe1; type='container' }
+                        SamplingFrequency = @{ _=@{ id=0xb5; type='float'; value=8000.0 } }
+                        OutputSamplingFrequency = @{ _=@{ id=0x78b5; type='float'; value=8000.0 } }
+                        Channels = @{ _=@{ id=0x9f; type='uint'; value=1 } }
+                        ChannelPositions = @{ _=@{ id=0x7d7b; type='binary' } }
+                        BitDepth = @{ _=@{ id=0x6264; type='uint' } }
+                    }
 
-                    TrackOperation = @{ id=0xe2; type='container'; children = @{
-                        TrackCombinePlanes = @{ id=0xe3; type='container'; children = @{
-                            TrackPlane = @{ id=0xe4; type='container'; multiple=$true; children = @{
-                                TrackPlaneUID = @{ id=0xe5; type='uint' }
-                                TrackPlaneType = @{ id=0xe6; type='uint' }
-                            }}
-                        }}
-                        TrackJoinBlocks = @{ id=0xe9; type='container'; children = @{
-                            TrackJoinUID = @{ id=0xed; type='uint'; multiple=$true }
-                        }}
-                    }}
+                    TrackOperation = @{ _=@{ id=0xe2; type='container' }
+                        TrackCombinePlanes = @{ _=@{ id=0xe3; type='container' }
+                            TrackPlane = @{ _=@{ id=0xe4; type='container'; multiple=$true }
+                                TrackPlaneUID = @{ _=@{ id=0xe5; type='uint' } }
+                                TrackPlaneType = @{ _=@{ id=0xe6; type='uint' } }
+                            }
+                        }
+                        TrackJoinBlocks = @{ _=@{ id=0xe9; type='container' }
+                            TrackJoinUID = @{ _=@{ id=0xed; type='uint'; multiple=$true } }
+                        }
+                    }
 
-                    TrickTrackUID = @{ id=0xc0; type='uint' }
-                    TrickTrackSegmentUID = @{ id=0xc1; type='binary' }
-                    TrickTrackFlag = @{ id=0xc6; type='uint' }
-                    TrickMasterTrackUID = @{ id=0xc7; type='uint' }
-                    TrickMasterTrackSegmentUID = @{ id=0xc4; type='binary' }
+                    TrickTrackUID = @{ _=@{ id=0xc0; type='uint' } }
+                    TrickTrackSegmentUID = @{ _=@{ id=0xc1; type='binary' } }
+                    TrickTrackFlag = @{ _=@{ id=0xc6; type='uint' } }
+                    TrickMasterTrackUID = @{ _=@{ id=0xc7; type='uint' } }
+                    TrickMasterTrackSegmentUID = @{ _=@{ id=0xc4; type='binary' } }
 
                     # Content Encoding
-                    ContentEncodings = @{ id=0x6d80; type='container'; children = @{
-                        ContentEncoding = @{ id=0x6240; type='container'; multiple=$true; children = @{
-                            ContentEncodingOrder = @{ id=0x5031; type='uint'; value=0 }
-                            ContentEncodingScope = @{ id=0x5032; type='uint'; value=1 }
-                            ContentEncodingType = @{ id=0x5033; type='uint' }
-                            ContentCompression = @{ id=0x5034; type='container'; children = @{
-                                ContentCompAlgo = @{ id=0x4254; type='uint'; value=0 }
-                                ContentCompSettings = @{ id=0x4255; type='binary' }
-                            }}
-                            ContentEncryption = @{ id=0x5035; type='container'; children = @{
-                                ContentEncAlgo = @{ id=0x47e1; type='uint'; value=0 }
-                                ContentEncKeyID = @{ id=0x47e2; type='binary' }
-                                ContentSignature = @{ id=0x47e3; type='binary' }
-                                ContentSigKeyID = @{ id=0x47e4; type='binary' }
-                                ContentSigAlgo = @{ id=0x47e5; type='uint' }
-                                ContentSigHashAlgo = @{ id=0x47e6; type='uint' }
-                            }}
-                        }}
-                    }}
-                }}
-            }}
+                    ContentEncodings = @{ _=@{ id=0x6d80; type='container' }
+                        ContentEncoding = @{ _=@{ id=0x6240; type='container'; multiple=$true }
+                            ContentEncodingOrder = @{ _=@{ id=0x5031; type='uint'; value=0 } }
+                            ContentEncodingScope = @{ _=@{ id=0x5032; type='uint'; value=1 } }
+                            ContentEncodingType = @{ _=@{ id=0x5033; type='uint' } }
+                            ContentCompression = @{ _=@{ id=0x5034; type='container' }
+                                ContentCompAlgo = @{ _=@{ id=0x4254; type='uint'; value=0 } }
+                                ContentCompSettings = @{ _=@{ id=0x4255; type='binary' } }
+                            }
+                            ContentEncryption = @{ _=@{ id=0x5035; type='container' }
+                                ContentEncAlgo = @{ _=@{ id=0x47e1; type='uint'; value=0 } }
+                                ContentEncKeyID = @{ _=@{ id=0x47e2; type='binary' } }
+                                ContentSignature = @{ _=@{ id=0x47e3; type='binary' } }
+                                ContentSigKeyID = @{ _=@{ id=0x47e4; type='binary' } }
+                                ContentSigAlgo = @{ _=@{ id=0x47e5; type='uint' } }
+                                ContentSigHashAlgo = @{ _=@{ id=0x47e6; type='uint' } }
+                            }
+                        }
+                    }
+                }
+            }
 
             # Cueing Data
-            Cues = @{ id=0x1c53bb6b; type='container'; children = @{
-                CuePoint = @{ id=0xbb; type='container'; multiple=$true; children = @{
-                    CueTime = @{ id=0xb3; type='uint' }
-                    CueTrackPositions = @{ id=0xb7; type='container'; multiple=$true; children = @{
-                        CueTrack = @{ id=0xf7; type='uint' }
-                        CueClusterPosition = @{ id=0xf1; type='uint' }
-                        CueRelativePosition = @{ id=0xf0; type='uint' }
-                        CueDuration = @{ id=0xb2; type='uint' }
-                        CueBlockNumber = @{ id=0x5378; type='uint'; value=1 }
-                        CueCodecState = @{ id=0xea; type='uint'; value=0 }
-                        CueReference = @{ id=0xdb; type='container'; multiple=$true; children = @{
-                            CueRefTime = @{ id=0x96; type='uint' }
-                            CueRefCluster = @{ id=0x97; type='uint' }
-                            CueRefNumber = @{ id=0x535f; type='uint'; value=1 }
-                            CueRefCodecState = @{ id=0xeb; type='uint'; value=0 }
-                        }}
-                    }}
-                }}
-            }}
+            Cues = @{ _=@{ id=0x1c53bb6b; type='container' }
+                CuePoint = @{ _=@{ id=0xbb; type='container'; multiple=$true }
+                    CueTime = @{ _=@{ id=0xb3; type='uint' } }
+                    CueTrackPositions = @{ _=@{ id=0xb7; type='container'; multiple=$true }
+                        CueTrack = @{ _=@{ id=0xf7; type='uint' } }
+                        CueClusterPosition = @{ _=@{ id=0xf1; type='uint' } }
+                        CueRelativePosition = @{ _=@{ id=0xf0; type='uint' } }
+                        CueDuration = @{ _=@{ id=0xb2; type='uint' } }
+                        CueBlockNumber = @{ _=@{ id=0x5378; type='uint'; value=1 } }
+                        CueCodecState = @{ _=@{ id=0xea; type='uint'; value=0 } }
+                        CueReference = @{ _=@{ id=0xdb; type='container'; multiple=$true }
+                            CueRefTime = @{ _=@{ id=0x96; type='uint' } }
+                            CueRefCluster = @{ _=@{ id=0x97; type='uint' } }
+                            CueRefNumber = @{ _=@{ id=0x535f; type='uint'; value=1 } }
+                            CueRefCodecState = @{ _=@{ id=0xeb; type='uint'; value=0 } }
+                        }
+                    }
+                }
+            }
 
             # Attachment
-            Attachments = @{ id=0x1941a469; type='container'; children = @{
-                AttachedFile = @{ id=0x61a7; type='container'; multiple=$true; children = @{
-                    FileDescription = @{ id=0x467e; type='string' }
-                    FileName = @{ id=0x466e; type='string' }
-                    FileMimeType = @{ id=0x4660; type='string' }
-                    FileData = @{ id=0x465c; type='binary' }
-                    FileUID = @{ id=0x46ae; type='uint' }
-                    FileReferral = @{ id=0x4675; type='binary' }
-                    FileUsedStartTime = @{ id=0x4661; type='uint' }
-                    FileUsedEndTime = @{ id=0x4662; type='uint' }
-                }}
-            }}
+            Attachments = @{ _=@{ id=0x1941a469; type='container' }
+                AttachedFile = @{ _=@{ id=0x61a7; type='container'; multiple=$true }
+                    FileDescription = @{ _=@{ id=0x467e; type='string' } }
+                    FileName = @{ _=@{ id=0x466e; type='string' } }
+                    FileMimeType = @{ _=@{ id=0x4660; type='string' } }
+                    FileData = @{ _=@{ id=0x465c; type='binary' } }
+                    FileUID = @{ _=@{ id=0x46ae; type='uint' } }
+                    FileReferral = @{ _=@{ id=0x4675; type='binary' } }
+                    FileUsedStartTime = @{ _=@{ id=0x4661; type='uint' } }
+                    FileUsedEndTime = @{ _=@{ id=0x4662; type='uint' } }
+                }
+            }
 
             # Chapters
-            Chapters = @{ id=0x1043a770; type='container'; children = @{
-                EditionEntry = @{ id=0x45b9; type='container'; multiple=$true; children = @{
-                    EditionUID = @{ id=0x45bc; type='uint' }
-                    EditionFlagHidden = @{ id=0x45bd; type='uint' }
-                    EditionFlagDefault = @{ id=0x45db; type='uint' }
-                    EditionFlagOrdered = @{ id=0x45dd; type='uint' }
-                    ChapterAtom = @{ id=0xb6; type='container'; multiple=$true; children = @{
-                        ChapterUID = @{ id=0x73c4; type='uint' }
-                        ChapterStringUID = @{ id=0x5654; type='binary' }
-                        ChapterTimeStart = @{ id=0x91; type='uint' }
-                        ChapterTimeEnd = @{ id=0x92; type='uint' }
-                        ChapterFlagHidden = @{ id=0x98; type='uint'; value=0 }
-                        ChapterFlagEnabled = @{ id=0x4598; type='uint'; value=0 }
-                        ChapterSegmentUID = @{ id=0x6e67; type='binary' }
-                        ChapterSegmentEditionUID = @{ id=0x6ebc; type='uint' }
-                        ChapterPhysicalEquiv = @{ id=0x63c3; type='uint' }
-                        ChapterTrack = @{ id=0x8f; type='container'; children = @{
-                            ChapterTrackNumber = @{ id=0x89; multiple=$true; type='uint' }
-                        }}
-                        ChapterDisplay = @{ id=0x80; type='container'; multiple=$true; children = @{
-                            ChapString = @{ id=0x85; type='string' }
-                            ChapLanguage = @{ id=0x437c; type='string'; multiple=$true; value='eng' }
-                            ChapCountry = @{ id=0x437e; type='string'; multiple=$true }
-                        }}
-                        ChapProcess = @{ id=0x6944; type='container'; multiple=$true; children = @{
-                            ChapProcessCodecID = @{ id=0x6955; type='uint' }
-                            ChapProcessPrivate = @{ id=0x450d; type='binary' }
-                            ChapProcessCommand = @{ id=0x6911; type='container'; multiple=$true; children = @{
-                                ChapProcessTime = @{ id=0x6922; type='uint' }
-                                ChapProcessData = @{ id=0x6933; type='binary' }
-                            }}
-                        }}
-                    }}
-                }}
-            }}
+            Chapters = @{ _=@{ id=0x1043a770; type='container' }
+                EditionEntry = @{ _=@{ id=0x45b9; type='container'; multiple=$true }
+                    EditionUID = @{ _=@{ id=0x45bc; type='uint' } }
+                    EditionFlagHidden = @{ _=@{ id=0x45bd; type='uint' } }
+                    EditionFlagDefault = @{ _=@{ id=0x45db; type='uint' } }
+                    EditionFlagOrdered = @{ _=@{ id=0x45dd; type='uint' } }
+                    ChapterAtom = @{ _=@{ id=0xb6; type='container'; multiple=$true }
+                        ChapterUID = @{ _=@{ id=0x73c4; type='uint' } }
+                        ChapterStringUID = @{ _=@{ id=0x5654; type='binary' } }
+                        ChapterTimeStart = @{ _=@{ id=0x91; type='uint' } }
+                        ChapterTimeEnd = @{ _=@{ id=0x92; type='uint' } }
+                        ChapterFlagHidden = @{ _=@{ id=0x98; type='uint'; value=0 } }
+                        ChapterFlagEnabled = @{ _=@{ id=0x4598; type='uint'; value=0 } }
+                        ChapterSegmentUID = @{ _=@{ id=0x6e67; type='binary' } }
+                        ChapterSegmentEditionUID = @{ _=@{ id=0x6ebc; type='uint' } }
+                        ChapterPhysicalEquiv = @{ _=@{ id=0x63c3; type='uint' } }
+                        ChapterTrack = @{ _=@{ id=0x8f; type='container' }
+                            ChapterTrackNumber = @{ _=@{ id=0x89; multiple=$true; type='uint' } }
+                        }
+                        ChapterDisplay = @{ _=@{ id=0x80; type='container'; multiple=$true }
+                            ChapString = @{ _=@{ id=0x85; type='string' } }
+                            ChapLanguage = @{ _=@{ id=0x437c; type='string'; multiple=$true; value='eng' } }
+                            ChapCountry = @{ _=@{ id=0x437e; type='string'; multiple=$true } }
+                        }
+                        ChapProcess = @{ _=@{ id=0x6944; type='container'; multiple=$true }
+                            ChapProcessCodecID = @{ _=@{ id=0x6955; type='uint' } }
+                            ChapProcessPrivate = @{ _=@{ id=0x450d; type='binary' } }
+                            ChapProcessCommand = @{ _=@{ id=0x6911; type='container'; multiple=$true }
+                                ChapProcessTime = @{ _=@{ id=0x6922; type='uint' } }
+                                ChapProcessData = @{ _=@{ id=0x6933; type='binary' } }
+                            }
+                        }
+                    }
+                }
+            }
 
             # Tagging
-            Tags = @{ id=0x1254c367; type='container'; multiple=$true; children = @{
-                Tag = @{ id=0x7373; type='container'; multiple=$true; children = @{
-                    Targets = @{ id=0x63c0; type='container'; children = @{
-                        TargetTypeValue = @{ id=0x68ca; type='uint' }
-                        TargetType = @{ id=0x63ca; type='string' }
-                        TagTrackUID = @{ id=0x63c5; type='uint'; multiple=$true; value=0 }
-                        TagEditionUID = @{ id=0x63c9; type='uint'; multiple=$true }
-                        TagChapterUID = @{ id=0x63c4; type='uint'; multiple=$true; value=0 }
-                        TagAttachmentUID = @{ id=0x63c6; type='uint'; multiple=$true; value=0 }
-                    }}
-                    SimpleTag = @{ id=0x67c8; type='container'; multiple=$true; children = @{
-                        TagName = @{ id=0x45a3; type='string' }
-                        TagLanguage = @{ id=0x447a; type='string' }
-                        TagDefault = @{ id=0x4484; type='uint' }
-                        TagString = @{ id=0x4487; type='string' }
-                        TagBinary = @{ id=0x4485; type='binary' }
-                    }}
-                }}
-            }}
-        }}
+            Tags = @{ _=@{ id=0x1254c367; type='container'; multiple=$true }
+                Tag = @{ _=@{ id=0x7373; type='container'; multiple=$true }
+                    Targets = @{ _=@{ id=0x63c0; type='container' }
+                        TargetTypeValue = @{ _=@{ id=0x68ca; type='uint' } }
+                        TargetType = @{ _=@{ id=0x63ca; type='string' } }
+                        TagTrackUID = @{ _=@{ id=0x63c5; type='uint'; multiple=$true; value=0 } }
+                        TagEditionUID = @{ _=@{ id=0x63c9; type='uint'; multiple=$true } }
+                        TagChapterUID = @{ _=@{ id=0x63c4; type='uint'; multiple=$true; value=0 } }
+                        TagAttachmentUID = @{ _=@{ id=0x63c6; type='uint'; multiple=$true; value=0 } }
+                    }
+                    SimpleTag = @{ _=@{ id=0x67c8; type='container'; multiple=$true }
+                        TagName = @{ _=@{ id=0x45a3; type='string' } }
+                        TagLanguage = @{ _=@{ id=0x447a; type='string' } }
+                        TagDefault = @{ _=@{ id=0x4484; type='uint' } }
+                        TagString = @{ _=@{ id=0x4487; type='string' } }
+                        TagBinary = @{ _=@{ id=0x4485; type='binary' } }
+                    }
+                }
+            }
+        }
     }
 
-    $names = flattenDTD $DTD
-    $IDs = flattenDTD $DTD -byID:$true
-
-    $DTD.__names = $names
-    $DTD.__IDs = $IDs
-    $DTD.__trackTypes = @{
-        1='Video'
-        2='Audio'
-        0x10='Logo'
-        0x11='Subtitle'
-        0x12='Buttons'
-        0x20='Control'
-    }
+    addReverseMapping $DTD
 }
 #endregion
 
