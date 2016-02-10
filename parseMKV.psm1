@@ -194,6 +194,10 @@ function parseMKV(
     $mkv.EBML = [Collections.ArrayList]@()
     $mkv.Segment = [Collections.ArrayList]@()
 
+    if ([bool]$keepStreamOpen) {
+        $mkv | add-member reader $bin
+    }
+
     while (!$state.abort -and $stream.position -lt $stream.length) {
 
         $meta = if (findNextRootContainer) { readEntry $mkv }
@@ -216,10 +220,8 @@ function parseMKV(
 
         readChildren $container
     }
-
-    if ([bool]$keepStreamOpen) {
-        $mkv | add-member reader $bin
-    } else {
+    
+    if (![bool]$keepStreamOpen) {
         $bin.close()
     }
     if ($opt.print) {
@@ -231,6 +233,7 @@ function parseMKV(
         }
     }
 
+    makeSingleParentsTransparent $mkv
     $mkv
 }
 
@@ -308,14 +311,21 @@ function readChildren($container) {
             }
         }
     }
-    # make single container's properties directly enumerable
-    # thus allowing to type $mkv.Segment.Info.SegmentUID without [0]'s
-    $singleParent = $container._.parent[$container._.name]
-    if ($singleParent.count -eq 1) {
-        add-member ([ordered]@{} + $container) -inputObject $singleParent
-    }
+    makeSingleParentsTransparent $container
     if ($opt.print -and !$state.abort -and !$state.print['postponed']) {
         printChildren $container
+    }
+}
+
+function makeSingleParentsTransparent($container) {
+    # make single container's properties directly enumerable
+    # thus allowing to type $mkv.Segment.Info.SegmentUID without [0]'s
+    forEach ($child in $container.getEnumerator()) {
+        if ($child.value -is [Collections.ArrayList] `
+        -and $child.value.count -eq 1 `
+        -and $child.value[0]._.type -ceq 'container') {
+            add-member ([ordered]@{} + $child.value[0]) -inputObject $child.value
+        }
     }
 }
 
@@ -945,7 +955,7 @@ function printEntry($entry) {
                 $entry.ChapterTimeStart._.displayString + ' ')
             $host.UI.write($colors.dim, 0,
                 ($flags -replace '.$', '$0 '))
-            forEach ($display in $entry['ChapterDisplay']) {
+            forEach ($display in [array]$entry['ChapterDisplay']) {
                 if ($display -ne $entry.ChapterDisplay[0]) {
                     $host.UI.write($colors.dim, 0, ' ')
                 }
@@ -986,10 +996,11 @@ function printEntry($entry) {
 
             $comma = ''
             forEach ($UID in $entry.Targets['TagTrackUID']) {
-                if ($track = $tracks.where({ $_.TrackUID -eq $UID }, 'first')) {
+                if ($trackUID = [array]$tracks.TrackUID -eq $UID) {
+                    $track = $trackUID._.parent
                     $host.UI.write($colors.normal, 0,
                         $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
-                    if ($track[0]['Name']) {
+                    if ($track['Name']) {
                         $host.UI.write($colors.reference, 0, " ($($track.Name))")
                     }
                 }
@@ -1062,7 +1073,7 @@ function showProgressIfStuck {
     }
     write-progress $state.print.progress `
         -percentComplete ($done * 100) `
-        -secondsRemaining $state.print.progressremain
+        -secondsRemaining ([Math]::min($state.print.progressremain, [int32]::maxValue))
 }
 
 #endregion
