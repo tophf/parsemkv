@@ -104,7 +104,8 @@ set-strictMode -version 4
 #>
 
 function parseMKV(
-        [string] [validateScript({ if ((test-path -literal $_) -or (test-path $_)) { $true }
+        [string] [parameter(valueFromPipeline)]
+                 [validateScript({ if ((test-path -literal $_) -or (test-path $_)) { $true }
                                    else { write-warning 'File not found'; throw } })]
     $filepath,
 
@@ -135,17 +136,21 @@ function parseMKV(
             if ($_ -is [string]) {
                 try { if ('' -match $_ -or $true) { $true } }
                 catch { write-warning 'Bad regex'; throw $_ }
-            } elseif ($_ -is [scriptblock]) { $true
-            } else { throw 'Should be a string or scriptblock'
+            } elseif ($_ -is [scriptblock] -or $_ -is [regex]) {
+                $true
+            } else {
+                print-warning 'Should be a string/regex/scriptblock'
+                throw $_
             }
         })]
-    $printFilter = '^(?!.*?/(SeekHead/|EBML/|Void\b))',
+    $printFilter = [regex]'^(?!.*?/(SeekHead/|EBML/|Void\b))',
 
         [scriptblock]
     $entryCallback
 ) {
+
     if (!(test-path -literal $filepath)) {
-        $filepath = (gi $filepath).fullName
+        $filepath = "$(gi $filepath)"
     }
     try {
         $stream = [IO.FileStream]::new(
@@ -172,13 +177,13 @@ function parseMKV(
     }
     # less ambiguous local alias
     $opt = @{
-        stopOn = $stopOn
+        stopOn = if ($stopOn) { [regex]$stopOn } else { '' }
         skip = $skip
         tags = $tags
         binarySizeLimit = $binarySizeLimit
         print = [bool]$print -or [bool]$printRaw
         printRaw = [bool]$printRaw
-        printFilter = $printFilter
+        printFilter = if ($printFilter -is [string]) { [regex]$printFilter } else { $printFilter }
         entryCallback = $entryCallback
     }
     if (!$opt.print -and $opt.tags -eq 'read-when-printing') {
@@ -186,6 +191,9 @@ function parseMKV(
     }
     if (!$opt.print -and $opt.tags -in 'skip','read-when-printing') {
         $opt.skip += '|/Tags/'
+    }
+    if ($opt.skip) {
+        $opt.skip = [regex]$opt.skip
     }
 
     $mkv = $dummyMeta.PSObject.copy()
@@ -220,7 +228,7 @@ function parseMKV(
 
         readChildren $container
     }
-    
+
     if (![bool]$keepStreamOpen) {
         $bin.close()
     }
@@ -356,30 +364,28 @@ function readEntry($container) {
     $meta = $dummyMeta.PSObject.copy()
     $meta.pos = $stream.position
 
-    $buf = [byte[]]::new(8)
-    $buf[0] = $_ = $bin.readByte()
+    $VINT = [byte[]]::new(8)
+    $VINT[0] = $first = $bin.readByte()
     $meta.id =
-        if ($_ -eq 0 -or $_ -eq 0xFF) {
+        if ($first -eq 0 -or $first -eq 0xFF) {
             -1
+        } elseif ($first -ge 0x80) {
+            $first
+        } elseif ($first -ge 0x40) {
+            [int]$first -shl 8 -bor $bin.readByte()
         } else {
-            $len = 8 - [byte][Math]::floor([Math]::log($_)/[Math]::log(2))
-            if ($len -eq 1) {
-                $_
-            } else {
-                $bin.read($buf, 1, $len - 1) >$null
-                [Array]::reverse($buf, 0, $len)
-                [BitConverter]::ToUInt64($buf, 0)
-            }
+            $len = 8 - [byte][Math]::floor([Math]::log($first)/[Math]::log(2))
+            $bin.read($VINT, 1, $len - 1) >$null
+            [Array]::reverse($VINT, 0, $len)
+            [BitConverter]::toUInt64($VINT, 0)
         }
 
     $idhex = '{0:x}' -f $meta.id
     if (!($info = $DTD._.globalIDs[$idhex])) {
         $info = $DTD
-        $subpath = $container._.path.substring(1)
-        while ($subpath) {
-            $s, $subpath = $subpath -split '/', 2
-            if (!$info._['nesting'] -or $s -ne $info._.name) {
-                $info = $info[$s]
+        forEach ($subpath in ($container._.path.substring(1) -split '/')) {
+            if ($subpath -and (!$info._['recursiveNesting'] -or $subpath -ne $info._.name)) {
+                $info = $info[$subpath]
             }
         }
         $info = $info._.IDs[$idhex]
@@ -400,20 +406,18 @@ function readEntry($container) {
         if ($info -and $info.contains('size')) {
             $info.size
         } else {
-            $buf.clear()
-            $buf[0] = $_ = $bin.readByte()
-            if ($_ -eq 0 -or $_ -eq 0xFF) {
-                0
+            $VINT.clear()
+            $VINT[0] = $first = $bin.readByte()
+            if ($first -ge 0x80) {
+                $first -band 0x7F
+            } elseif ($first -ge 0x40) {
+                ([int]$first -band 0x3F) -shl 8 -bor $bin.readByte()
             } else {
-                $len = 8 - [byte][Math]::floor([Math]::log($_)/[Math]::log(2))
-                $buf[0] = $_ = $_ -band -bnot (1 -shl (8-$len))
-                if ($len -eq 1) {
-                    $_
-                } else {
-                    $bin.read($buf, 1, $len - 1) >$null
-                    [Array]::reverse($buf, 0, $len)
-                    [BitConverter]::ToUInt64($buf, 0)
-                }
+                $len = 8 - [byte][Math]::floor([Math]::log($first)/[Math]::log(2))
+                $VINT[0] = $first -band -bnot (1 -shl (8-$len))
+                $bin.read($VINT, 1, $len - 1) >$null
+                [Array]::reverse($VINT, 0, $len)
+                [BitConverter]::toUInt64($VINT, 0)
             }
         }
 
@@ -424,7 +428,7 @@ function readEntry($container) {
         return $meta
     }
 
-    if ($opt.stopOn -and $meta.path -match $opt.stopOn) {
+    if ($opt.stopOn -and $opt.stopOn.match($meta.path).success) {
         $stream.position = $meta.pos
         return $null
     }
@@ -433,7 +437,7 @@ function readEntry($container) {
     $meta.root = $container._['root']
     $meta.parent = $container
 
-    if ($opt.skip -and $meta.path -match $opt.skip) {
+    if ($opt.skip -and $opt.skip.match($meta.path).success) {
         $stream.position += $size
         $meta.ref = [ordered]@{ _=$meta }
         $meta.skipped = $true
@@ -450,46 +454,48 @@ function readEntry($container) {
                     if ($size -eq 1) {
                         $value = $bin.readSByte()
                     } else {
-                        $buf.clear()
-                        $bin.read($buf, 0, $size) >$null
-                        [Array]::reverse($buf, 0, $size)
-                        $value = [BitConverter]::toInt64($buf, 0)
+                        $VINT.clear()
+                        $bin.read($VINT, 0, $size) >$null
+                        [Array]::reverse($VINT, 0, $size)
+                        $value = [BitConverter]::toInt64($VINT, 0)
                         if ($size -lt 8) {
                             $value -= ([int64]1 -shl $size*8)
                         }
                     }
                 }
                 'uint' {
-                    if ($size -eq 1) {
-                        $value = $bin.readByte()
-                    } else {
-                        $buf.clear()
-                        $bin.read($buf, 0, $size) >$null
-                        [Array]::reverse($buf, 0, $size)
-                        $value = [BitConverter]::toUInt64($buf, 0)
+                    switch ($size) {
+                        1 { $value = $bin.readByte() }
+                        2 { $value = [int]$bin.readByte() -shl 8 -bor $bin.readByte() }
+                        default {
+                            $VINT.clear()
+                            $bin.read($VINT, 0, $size) >$null
+                            [Array]::reverse($VINT, 0, $size)
+                            $value = [BitConverter]::toUInt64($VINT, 0)
+                        }
                     }
                 }
                 'float' {
                     $buf = $bin.readBytes($size)
                     [Array]::reverse($buf)
-                    switch ($size) {
-                        4 { $value = [BitConverter]::toSingle($buf, 0) }
-                        8 { $value = [BitConverter]::toDouble($buf, 0) }
-                        10 { $value = decodeLongDouble $buf }
+                    $value = switch ($size) {
+                        4 { [BitConverter]::toSingle($buf, 0) }
+                        8 { [BitConverter]::toDouble($buf, 0) }
+                        10 { decodeLongDouble $buf }
                         default {
                             write-warning "FLOAT should be 4, 8 or 10 bytes, got $size"
-                            $value = 0.0
+                            0.0
                         }
                     }
                 }
                 'date' {
-                    if ($size -ne 8) {
+                    $rawvalue = if ($size -ne 8) {
                         write-warning "DATE should be 8 bytes, got $size"
-                        $rawvalue = 0
+                        0
                     } else {
-                        $buf = $bin.readBytes(8)
-                        [Array]::reverse($buf)
-                        $rawvalue = [BitConverter]::toInt64($buf,0)
+                        $bin.read($VINT, 0, 8) >$null
+                        [Array]::reverse($VINT)
+                        [BitConverter]::toInt64($VINT,0)
                     }
                     $value = ([datetime]'2001-01-01T00:00:00.000Z').addTicks($rawvalue/100)
                 }
@@ -498,16 +504,19 @@ function readEntry($container) {
                 }
                 'binary' {
                     $readSize = if ($opt.binarySizeLimit -lt 0) { $size }
-                                else { [Math]::min($opt.binarySizeLimit,$size) }
+                                else { [Math]::min($opt.binarySizeLimit, $size) }
                     if ($readSize) {
-                        $value = $bin.ReadBytes($readSize)
+                        $value = $bin.readBytes($readSize)
+
                         if ($meta.name -cmatch '\wUID$') {
                             $meta.displayString = bin2hex $value
-                        } elseif ($meta.name -eq '?') {
+                        }
+                        elseif ($meta.name -eq '?') {
                             $s = [Text.Encoding]::UTF8.getString($value)
                             if ($s -cmatch '^[\x20-\x7F]+$') {
                                 $meta.displayString =
-                                    [BitConverter]::toString($value, 0, [Math]::min(16,$value.length)) +
+                                    [BitConverter]::toString($value, 0,
+                                                             [Math]::min(16,$value.length)) +
                                     @('','...')[[int]($readSize -gt 16)] +
                                     " possible ASCII string: $s"
                             }
@@ -535,8 +544,12 @@ function readEntry($container) {
             'float' { if ($size -eq 4) { [single] } else { [double] } }
         }
 
-        # using explicit assignment to keep empty values that get lost in $var=if(...) {val1} else {val2}
-        if ($typecast) { $result = $value -as $typecast } else { $result = $value }
+        # using explicit assignment to keep empty values that get lost in $var=if....
+        if ($typecast) {
+            $result = $value -as $typecast
+        } else {
+            $result = $value
+        }
 
         # cook the values
         switch -regex ($meta.path) {
@@ -653,7 +666,7 @@ function locateTagsBlock {
                             $vint[0] = $first
                             [Buffer]::blockCopy($buf, $sizepos+1, $vint, 1, $sizelen-1)
                             [Array]::reverse($vint, 0, $sizelen)
-                            [BitConverter]::ToUInt64($vint, 0)
+                            [BitConverter]::toUInt64($vint, 0)
                         }
                     if ($start + $sizepos + $sizelen + $size -eq $end) {
                         $stream.position = $start + $idpos
@@ -838,8 +851,8 @@ function printEntry($entry) {
     if ($meta['skipped']) {
         return
     }
-    if ($opt.printFilter -is [string]) {
-        if (!($meta.path -match $opt.printFilter)) {
+    if ($opt.printFilter -is [regex]) {
+        if (!$opt.printFilter.match($meta.path).success) {
             showProgressIfStuck
             return
         }
@@ -1083,18 +1096,19 @@ function init {
 
     function addReverseMapping([hashtable]$container) {
 
-        $container._.IDs = @{}
+        $meta = $container._
+        $meta.IDs = @{}
 
-        if ($container._['nesting']) {
-            $container._.IDs['{0:x}' -f $container._.id] = $container
+        if ($meta['recursiveNesting']) {
+            $meta.IDs['{0:x}' -f $meta.id] = $container
         }
 
-        $container.getEnumerator().forEach({
-            if ($_.key -ne '_') {
-                $v = $_.value
-                $v._.name = $_.key
+        forEach ($child in $container.getEnumerator()) {
+            if ($child.key -ne '_') {
+                $v = $child.value
+                $v._.name = $child.key
                 $id = '{0:x}' -f $v._.id
-                $container._.IDs[$id] = $v
+                $meta.IDs[$id] = $v
 
                 if ($v._['global']) {
                     $DTD._.globalIDs[$id] = $v
@@ -1104,12 +1118,12 @@ function init {
                     addReverseMapping $v
                 }
             }
-        })
+        }
     }
 
     # postpone printing these small sections until all contained info is known
-    $script:printPostponed = '/(Info|Tracks|ChapterAtom|Tag|EditionEntry)/$'
-    $script:printPretty = `
+    $script:printPostponed = [regex] '/(Info|Tracks|ChapterAtom|Tag|EditionEntry)/$'
+    $script:printPretty = [regex] (
         '/Segment/$|' +
         '/Info/(TimecodeScale|SegmentUID)$|' +
         '/Tracks/TrackEntry/(|' +
@@ -1129,6 +1143,7 @@ function init {
         ')$|' +
         '/Attachments/AttachedFile/|' +
         '/Tags/Tag/'
+    )
     $script:numberFormat = [Globalization.CultureInfo]::InvariantCulture
     $script:lookupChunkSize = 512
 
@@ -1458,7 +1473,7 @@ function init {
                     EditionFlagHidden = @{ _=@{ id=0x45bd; type='uint' } }
                     EditionFlagDefault = @{ _=@{ id=0x45db; type='uint' } }
                     EditionFlagOrdered = @{ _=@{ id=0x45dd; type='uint' } }
-                    ChapterAtom = @{ _=@{ id=0xb6; type='container'; multiple=$true; nesting=$true }
+                    ChapterAtom = @{ _=@{ id=0xb6; type='container'; multiple=$true; recursiveNesting=$true }
                         ChapterUID = @{ _=@{ id=0x73c4; type='uint' } }
                         ChapterStringUID = @{ _=@{ id=0x5654; type='binary' } }
                         ChapterTimeStart = @{ _=@{ id=0x91; type='uint' } }
@@ -1499,7 +1514,7 @@ function init {
                         TagChapterUID = @{ _=@{ id=0x63c4; type='uint'; multiple=$true; value=0 } }
                         TagAttachmentUID = @{ _=@{ id=0x63c6; type='uint'; multiple=$true; value=0 } }
                     }
-                    SimpleTag = @{ _=@{ id=0x67c8; type='container'; multiple=$true; nesting=$true }
+                    SimpleTag = @{ _=@{ id=0x67c8; type='container'; multiple=$true; recursiveNesting=$true }
                         TagName = @{ _=@{ id=0x45a3; type='string' } }
                         TagLanguage = @{ _=@{ id=0x447a; type='string' } }
                         TagDefault = @{ _=@{ id=0x4484; type='uint' } }
