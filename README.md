@@ -75,7 +75,7 @@ Usage examples:
   ```
 
   ```powershell
-  ($mkv.find('ChapterTimeStart') | %{ $_._.displayString }) -join ", "
+  $mkv.find('ChapterTimeStart')._.displayString -join ", "
   ```
 
   ```powershell
