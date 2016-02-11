@@ -7,7 +7,7 @@ Usage examples:
   ```powershell
   parseMKV 'c:\some\path\file.mkv' -print
   ```
-![screenshot](https://i.imgur.com/sxtVJDK.png)
+![screenshot](https://i.imgur.com/RgqnbQM.png)
 
   Some entries are skipped by default, see parameter descriptions in the code.
 
@@ -33,15 +33,14 @@ Usage examples:
 * **Extract the attachments**
   ```powershell
   $mkv = parseMKV 'c:\some\path\file.mkv' -keepStreamOpen -binarySizeLimit 0
-  $mkv.Attachments.AttachedFile | %{
-  	$file = [IO.File]::create($_.FileName)
-  	$size = $_.FileData._.size
-  	$mkv._.reader.baseStream.position = $_.FileData._.datapos
-  	$data = $mkv._.reader.readBytes($size)
-  	$file.write($data, 0, $size)
+  forEach ($att in $mkv.find('AttachedFile')) {
+  	$file = [IO.File]::create($att.FileName)
+  	$mkv.reader.baseStream.position = $att.FileData._.datapos
+  	$data = $mkv.reader.readBytes($att.FileData._.size)
+  	$file.write($data, 0, $data.length)
   	$file.close()
   }
-  $mkv._.reader.close()
+  $mkv.reader.close()
   ```
 
 * **Print with filtering**
@@ -55,7 +54,8 @@ Usage examples:
 
   ```powershell
   parseMKV 'c:\some\path\file.mkv' -print -printFilter { param($e)
-  	$e._.name -match '^Chap(String|Lang|terTime)' -and $e._.closest('ChapterAtom').ChapterTimeStart.hours -ge 1
+  	$e._.name -match '^Chap(String|Lang|terTime)' -and `
+  	$e._.closest('ChapterAtom').ChapterTimeStart.hours -ge 1
   }
   ```
 
@@ -65,8 +65,8 @@ Usage examples:
   ```
 
   ```powershell
-  $DisplayWidth = $mkv._.find('DisplayWidth')
-  $DisplayHeight = $mkv._.find('DisplayHeight')
+  $DisplayWidth = $mkv.find('DisplayWidth')
+  $DisplayHeight = $mkv.find('DisplayHeight')
   $VideoCodecID = $DisplayWidth._.closest('TrackEntry').CodecID
   ```
 
@@ -75,13 +75,12 @@ Usage examples:
   ```
 
   ```powershell
-  ($mkv._.find('ChapterTimeStart') | %{ $_._.displayString }) -join ", "
+  ($mkv.find('ChapterTimeStart') | %{ $_._.displayString }) -join ", "
   ```
 
   ```powershell
-  $mkv._.find('ChapterAtom') | %{
-  	'{0:h\:mm\:ss}' -f $_._.find('ChapterTimeStart') +
-  	" - " +
-  	$_._.find('ChapString')
+  forEach ($chapter in $mkv.find('ChapterAtom')) {
+  	'{0:h\:mm\:ss}' -f $chapter._.find('ChapterTimeStart') +
+  	' - ' + $chapter._.find('ChapString')
   }
   ```
