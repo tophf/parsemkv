@@ -318,14 +318,13 @@ function readChildren($container) {
     }
 
     if ($container._.name -eq 'SeekHead') {
-        $heads = [ordered]@{}
         $segdatapos = $container._.root._.datapos
         forEach ($seek in $container.Seek) {
             if ($section = $DTD.Segment._.IDs[(bin2hex $seek.SeekID)]) {
-                $heads[$section._.name] = $seekHead[$section._.name] = $segdatapos + $seek.SeekPosition
+                $seekHead[$section._.name] = $segdatapos + $seek.SeekPosition
             }
         }
-        add-member $heads -inputObject $container._.parent.SeekHead
+        add-member named $seekHead -inputObject $container._.parent.SeekHead
     }
 
     makeSingleParentsTransparent $container
@@ -878,7 +877,6 @@ function printEntry($entry) {
                 $comma = ', '
             }
         }
-        return $true
     }
 
     $meta = $entry._
