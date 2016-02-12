@@ -15,7 +15,7 @@ set-strictMode -version 4
     Input file path
 
 .PARAMETER get
-    Top-level sections to get, an array of strings.
+    Level-1 sections to get, an array of strings.
     Default: 'Info','Tracks','Chapters','Attachments' and additionally 'Tags' when printing.
     '*' means everything, *common' - the four above.
     '*exhaustiveSearch' - in case a block wasn't found automatically it will be searched
@@ -123,6 +123,9 @@ function parseMKV(
         [switch]
     $printRaw,
 
+        [switch]
+    $showProgress,
+
         [scriptblock]
     $entryCallback
 ) {
@@ -160,12 +163,17 @@ function parseMKV(
         binarySizeLimit = $binarySizeLimit
         print = [bool]$print -or [bool]$printRaw
         printRaw = [bool]$printRaw
+        showProgress = [bool]$showProgress -or [bool]$print -or [bool]$printRaw
         entryCallback = $entryCallback
     }
     $get | %{ $opt.get[$_] = $true }
     $opt.get['/EBML/'] = $opt.get['/Segment/'] = $true
     if ($opt.print -and $opt.get['Tags:whenPrinting']) {
         $opt.get.Tags = $true
+    }
+    if ('*' -in $get) {
+        $DTD.getEnumerator() | ?{ $_.name -ne '_' } | %{ $opt.get[$_.name] = $true }
+        $DTD.Segment.getEnumerator() | ?{ $_.name -ne '_' } | %{ $opt.get[$_.name] = $true }
     }
 
     $mkv = $dummyMeta.PSObject.copy()
@@ -272,21 +280,18 @@ function readChildren($container) {
                 $state.print.postponed = $false
             }
             continue
-        } elseif (!$lastContainerServed) {
-            # don't jump looking for tags if the segment is still empty
-            # (quite probably the user just skips some sections like SeekHead)
-            if ($meta.root.count -or $meta.name -eq 'Cluster') {
-                if (locateLastContainer) {
+        } elseif (!$lastContainerServed -and $meta.name -ne 'Void') {
+            if ($meta.name -eq 'Cluster') {
+                if ($opt.get['*exhaustiveSearch'] -and (locateLastContainer)) {
                     $lastContainerServed = $true
                     continue
                 }
-                if (!$opt.get['exhaustiveSearch']) {
+                if (!$opt.get['*exhaustiveSearch']) {
                     $stream.position = $stopAt
                     break
                 }
-                $state.exhaustiveSearch = $true
             }
-            if ($opt.print) {
+            if ($opt.showProgress -and ([datetime]::now.ticks - $state.print['progresstick'] -ge 1000000)) {
                 showProgressIfStuck
             }
         }
@@ -294,6 +299,16 @@ function readChildren($container) {
     makeSingleParentsTransparent $container
     if ($opt.print -and !$state.abort -and !$state.print['postponed']) {
         printChildren $container
+    } elseif ($opt.showProgress -and ([datetime]::now.ticks - $state.print['progresstick'] -ge 1000000)) {
+        showProgressIfStuck
+    }
+    if ($container._.level -le 1) {
+        $name = if ($container._.level) { $container._.name } else { $container._.path }
+        $opt.get.remove($name)
+        # when all level-1 sections are done purge the list so locateLastContainer won't be needlessly invoked
+        if ($opt.get.count -eq 1 -and $opt.get[0] -eq '/Segment/') {
+            $opt.get.clear()
+        }
     }
 }
 
@@ -405,7 +420,7 @@ function readEntry($container) {
     $meta.root = $container._['root']
     $meta.parent = $container
 
-    if ($meta.path -match '^/.*?/(.+?)/' -and !$opt.get[$matches[1]] -or $meta.name -eq 'Void') {
+    if (($meta.path -match '^/.*?/(.+?)/' -or $meta.name -eq 'Void') -and !$opt.get[$matches[1]]) {
         $stream.position += $size
         $meta.ref = [ordered]@{ _=$meta }
         $meta.skipped = $true
@@ -586,10 +601,9 @@ function locateLastContainer {
     $seg = $meta.closest('Segment')
     [uint64]$end = $seg._.datapos + $seg._.size
 
-    $maxBackSteps = 4096
-    $stepSize = $lookupChunkSize
+    $maxBackSteps = [int]0x100000 / $lookupChunkSize # max 1MB
 
-    if ($stream.position + 16*$meta.size + $maxBackSteps*$stepSize -gt $end) {
+    if ($stream.position + 16*$meta.size + $maxBackSteps*$lookupChunkSize -gt $end) {
         # do nothing if the stream's end is near
         return
     }
@@ -602,8 +616,8 @@ function locateLastContainer {
     $last = $end
 
     forEach ($step in 1..$maxBackSteps) {
-        $stream.position = $start = $end - $stepSize*$step
-        $buf = $bin.readBytes($stepSize + 8*2) # max 8-byte id and size
+        $stream.position = $start = $end - $lookupChunkSize*$step
+        $buf = $bin.readBytes($lookupChunkSize + 8*2) # max 8-byte id and size
         $haystack = [BitConverter]::toString($buf)
 
         # try locating Tags first but in case the last section is
@@ -641,7 +655,7 @@ function locateLastContainer {
                     continue
                 }
                 $section = $DTD.Segment._.IDs[$IDhex -replace '-','']
-                if ($section -and $opt.get[$section._.name] -and !$seg.contains($section._.name)) {
+                if ($section -and $opt.get[$section._.name]) {
                     $stream.position = $start + $idpos
                     return $true
                 }
@@ -823,6 +837,26 @@ function printEntry($entry) {
         }
     }
 
+    function listTracksFor([string[]]$IDs, [string]$IDname) {
+        $tracks = $meta.closest('Segment')['Tracks']
+        if (!$tracks) {
+            return
+        }
+        $comma = ''
+        forEach ($ID in $IDs) {
+            if ($track = $tracks.TrackEntry.where({ $_[$IDname] -eq $ID }, 'first')) {
+                $track = $track[0]
+                $host.UI.write($colors.normal, 0,
+                    $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
+                if ($track['Name']) {
+                    $host.UI.write($colors.reference, 0, " ($($track.Name))")
+                }
+                $comma = ', '
+            }
+        }
+        return $true
+    }
+
     $meta = $entry._
     if ($meta['skipped']) {
         return
@@ -969,28 +1003,26 @@ function printEntry($entry) {
             return
         }
         '/Tag/$' {
-            $tracks = $meta.closest('Segment')['Tracks']
             $host.UI.write($colors.container, 0, "${indent}Tags ")
-
-            if ($tracks) {
-                $comma = ''
-                forEach ($UID in $entry.Targets['TagTrackUID']) {
-                    if ($trackUID = [array]$tracks.TrackEntry.TrackUID -eq $UID) {
-                        $track = $trackUID._.parent
-                        $host.UI.write($colors.normal, 0,
-                            $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
-                        if ($track['Name']) {
-                            $host.UI.write($colors.reference, 0, " ($($track.Name))")
-                        }
-                    }
-                    $comma = ', '
-                }
-            }
+            listTracksFor $entry.Targets['TagTrackUID'] 'TrackUID'
             $host.UI.writeLine()
-
             printSimpleTags $entry
-
             $host.UI.writeLine()
+            return
+        }
+        '/CuePoint/$' {
+            $cueTime = $entry.CueTime._.displayString -split ' '
+            foreach ($cue in $entry.CueTrackPositions) {
+                $host.UI.write($colors.container, 0, "${indent}Cue: ")
+                $host.UI.write($colors.normal, 0, 'track ')
+                $host.UI.write($colors.reference, 0, "$($cue.CueTrack) ")
+                $host.UI.write($colors.dim, 0, $cueTime[0] + ' ')
+                $host.UI.write($colors.value, 0, $cueTime[1] + ' ')
+                $host.UI.write($colors.normal, 0, '-> ' + $cue.CueClusterPosition +
+                    ($cue['CueRelativePosition'] -replace '^.',':$0') + "`t")
+                listTracksFor @($cue.CueTrack) 'TrackNumber'
+                $host.UI.writeLine()
+            }
             $last.omitLineFeed = $true
             return
         }
@@ -1031,13 +1063,16 @@ function printEntry($entry) {
 function showProgressIfStuck {
     $tick = [datetime]::now.ticks
     <# after 0.5sec of silence #>
-    if ($tick - $state.print.tick -lt 5000000 `
-    <# update slider every 0.1sec #> `
-    -or $tick - $state.print['progresstick'] -lt 1000000) {
+    if ($tick - $state.print.tick -lt 5000000) {
         return
     }
     $state.print.progresstick = $tick
-    $done = $meta.pos / $stream.length
+    if ($meta.path -match '/Cluster/') {
+        $section = $meta.closest('Segment')
+    } else {
+        $section = $meta.closest('','/Segment/\w+/$')
+    }
+    $done = ($meta.pos - $section._.datapos) / $section._.size
     <# and update remaining time every 1sec #>
     if (!$state.print['progress'] -or $tick - $state.print['progressmsgtick'] -ge 10000000) {
         $silentSeconds = ($tick - $state.print.tick)/10000000
@@ -1046,8 +1081,8 @@ function showProgressIfStuck {
         $state.print.progressremain =
             if (!$state.print['progress']) { $remain }
             else { ($state.print.progressremain + $remain) / 2 }
-        $action = @('Reading silently', 'Skipping')[!!$meta['skipped']]
-        <# show top-level section name to avoid flicker of alternate subcontainers #>
+        $action = @('Reading', 'Skipping')[!!$meta['skipped']]
+        <# show level-1 section name to avoid flicker of alternate subcontainers #>
         $state.print.progress = "$action $($meta.path -replace '^/\w+/(\w+).*','$1') elements..."
         $state.print.progressmsgtick = $tick
     }
@@ -1089,7 +1124,7 @@ function init {
     }
 
     # postpone printing these small sections until all contained info is known
-    $script:printPostponed = [regex] '/(Info|Tracks|ChapterAtom|Tag|EditionEntry)/$'
+    $script:printPostponed = [regex] '/(Info|Tracks|ChapterAtom|Tag|EditionEntry|CuePoint)/$'
     $script:printPretty = [regex] (
         '/Segment/$|' +
         '/Info/(TimecodeScale|SegmentUID)$|' +
@@ -1112,10 +1147,11 @@ function init {
         '/Tags/Tag/|' +
         '/SeekHead/|' +
         '/EBML/|' +
-        '/Void\b'
+        '/Void\b|' +
+        '/CuePoint/'
     )
     $script:numberFormat = [Globalization.CultureInfo]::InvariantCulture
-    $script:lookupChunkSize = 512
+    $script:lookupChunkSize = 4096
 
     $script:dummyMeta = @{}
 
