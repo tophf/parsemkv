@@ -14,9 +14,12 @@ set-strictMode -version 4
 .PARAMETER filepath
     Input file path
 
-.PARAMETER stopOn
-    Stop parsing when /an/entry/path/ matches the regex pattern, case-insensitive.
-    Specify an empty string to disable
+.PARAMETER get
+    Top-level sections to get, an array of strings.
+    Default: 'Info','Tracks','Chapters','Attachments' and additionally 'Tags' when printing.
+    '*' means everything, *common' - the four above.
+    '*exhaustiveSearch' - in case a block wasn't found automatically it will be searched
+    by sequentially skipping all [usually Cluster] elements which may take a long time
 
 .PARAMETER binarySizeLimit
     Do not autoread binary data bigger than this number of bytes, specify -1 for no limit
@@ -35,14 +38,11 @@ set-strictMode -version 4
 .PARAMETER print
     Pretty-print to the console.
 
-.PARAMETER printFilter
-    Only elements with names matching the provided regexp or scriptblock will be printed.
-    Scriptblock receives 'entry' as a parameter and should return a boolean value.
-    By default 'SeekHead', 'EBML', 'Void' elements are skipped.
-    Empty string = print everything.
-
 .EXAMPLE
     parseMKV 'c:\some\path\file.mkv' -print
+
+.EXAMPLE
+    parseMKV 'c:\some\path\file.mkv' -get Info -print
 
 .EXAMPLE
     $mkv = parseMKV 'c:\some\path\file.mkv'`
@@ -59,7 +59,7 @@ set-strictMode -version 4
     $mkv = parseMKV 'c:\some\path\file.mkv' -stopOn '/tracks/' -binarySizeLimit 0
 
     $duration = $mkv.Segment.Info.Duration
-    $duration = $mkv.Segment[0].Info[0].Duration
+    $duration = $mkv.Segment[1].Info[0].Duration # multi-segmented mkv!
 
 .EXAMPLE
     $mkv = parseMKV 'c:\some\path\file.mkv' -keepStreamOpen -binarySizeLimit 0
@@ -72,16 +72,6 @@ set-strictMode -version 4
         $file.close()
     }
     $mkv.reader.close()
-
-.EXAMPLE
-    parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0]._.type -eq 'string' }
-
-    parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0] -is [datetime] }
-
-    parseMKV 'c:\some\path\file.mkv' -print -printFilter { param($e)
-        $e._.name -match '^Chap(String|Lang|terTime)' -and `
-        $e._.closest('ChapterAtom').ChapterTimeStart.hours -ge 1
-    }
 
 .EXAMPLE
     $mkv = parseMKV 'c:\some\path\file.mkv'
@@ -109,16 +99,17 @@ function parseMKV(
                                    else { write-warning 'File not found'; throw } })]
     $filepath,
 
-        [string] [validateScript({ try { if ('' -match $_ -or $true) { $true } }
-                                   catch { write-warning 'Bad regex'; throw $_ } })]
-    $stopOn,
-
-        [string] [validateScript({ try { if ('' -match $_ -or $true) { $true } }
-                                   catch { write-warning 'Bad regex'; throw $_ } })]
-    $skip = '^/Segment/(SeekHead|Cluster|Cue)', <# checked only after -stopOn #>
-
-        [string] [validateSet('skip','read-when-printing','read','exhaustive-search')]
-    $tags = 'read-when-printing',
+        [string[]]
+        [validateSet('*',
+                     '*common', <# comprises the next four #>
+                     'Info','Tracks','Chapters','Attachments',
+                     'Tags','Tags:whenPrinting',
+                     'SeekHead','Cluster','Cues',
+                     '*exhaustiveSearch')]
+    $get = @(
+        '*common'
+        'Tags:whenPrinting'
+    ),
 
         [int32] [validateRange(-1, [int32]::MaxValue)]
     $binarySizeLimit = 16,
@@ -131,19 +122,6 @@ function parseMKV(
 
         [switch]
     $printRaw,
-
-        [validateScript({
-            if ($_ -is [string]) {
-                try { if ('' -match $_ -or $true) { $true } }
-                catch { write-warning 'Bad regex'; throw $_ }
-            } elseif ($_ -is [scriptblock] -or $_ -is [regex]) {
-                $true
-            } else {
-                print-warning 'Should be a string/regex/scriptblock'
-                throw $_
-            }
-        })]
-    $printFilter = [regex]'^(?!.*?/(SeekHead/|EBML/|Void\b))',
 
         [scriptblock]
     $entryCallback
@@ -177,23 +155,17 @@ function parseMKV(
     }
     # less ambiguous local alias
     $opt = @{
-        stopOn = if ($stopOn) { [regex]$stopOn } else { '' }
-        skip = $skip
-        tags = $tags
+        get = if ('*common' -in $get) { @{Info=1; Tracks=1; Chapters=1; Attachments=1} }
+              else { @{} }
         binarySizeLimit = $binarySizeLimit
         print = [bool]$print -or [bool]$printRaw
         printRaw = [bool]$printRaw
-        printFilter = if ($printFilter -is [string]) { [regex]$printFilter } else { $printFilter }
         entryCallback = $entryCallback
     }
-    if (!$opt.print -and $opt.tags -eq 'read-when-printing') {
-        $opt.tags = 'skip'
-    }
-    if (!$opt.print -and $opt.tags -in 'skip','read-when-printing') {
-        $opt.skip += '|/Tags/'
-    }
-    if ($opt.skip) {
-        $opt.skip = [regex]$opt.skip
+    $get | %{ $opt.get[$_] = $true }
+    $opt.get['/EBML/'] = $opt.get['/Segment/'] = $true
+    if ($opt.print -and $opt.get['Tags:whenPrinting']) {
+        $opt.get.Tags = $true
     }
 
     $mkv = $dummyMeta.PSObject.copy()
@@ -303,12 +275,12 @@ function readChildren($container) {
         } elseif (!$lastContainerServed) {
             # don't jump looking for tags if the segment is still empty
             # (quite probably the user just skips some sections like SeekHead)
-            if ($meta.root.count -and !$state['exhaustiveSearch']) {
-                if ($opt.tags -ne 'skip' -and (locateTagsBlock)) {
+            if ($meta.root.count -or $meta.name -eq 'Cluster') {
+                if (locateLastContainer) {
                     $lastContainerServed = $true
                     continue
                 }
-                if ($opt.tags -ne 'exhaustive-search') {
+                if (!$opt.get['exhaustiveSearch']) {
                     $stream.position = $stopAt
                     break
                 }
@@ -331,7 +303,8 @@ function makeSingleParentsTransparent($container) {
     forEach ($child in $container.getEnumerator()) {
         if ($child.value -is [Collections.ArrayList] `
         -and $child.value.count -eq 1 `
-        -and $child.value[0]._.type -ceq 'container') {
+        -and $child.value[0]._.type -ceq 'container' `
+        -and $child.value[0].count -gt 0) {
             add-member ([ordered]@{} + $child.value[0]) -inputObject $child.value
         }
     }
@@ -428,16 +401,11 @@ function readEntry($container) {
         return $meta
     }
 
-    if ($opt.stopOn -and $opt.stopOn.match($meta.path).success) {
-        $stream.position = $meta.pos
-        return $null
-    }
-
     $meta.level = $container._['level'] + 1
     $meta.root = $container._['root']
     $meta.parent = $container
 
-    if ($opt.skip -and $opt.skip.match($meta.path).success) {
+    if ($meta.path -match '^/.*?/(.+?)/' -and !$opt.get[$matches[1]] -or $meta.name -eq 'Void') {
         $stream.position += $size
         $meta.ref = [ordered]@{ _=$meta }
         $meta.skipped = $true
@@ -614,7 +582,7 @@ function readEntry($container) {
     $meta
 }
 
-function locateTagsBlock {
+function locateLastContainer {
     $seg = $meta.closest('Segment')
     [uint64]$end = $seg._.datapos + $seg._.size
 
@@ -626,11 +594,12 @@ function locateTagsBlock {
         return
     }
     $vint = [byte[]]::new(8)
-    $IDs = 'Tags','SeekHead','Cluster','Cues' | %{
+    $IDs = 'Tags','SeekHead','Cluster','Cues','Chapters','Attachments','Tracks','Info' | %{
         $IDhex = $DTD.Segment[$_]._.id.toString('X')
         if ($IDhex.length -band 1) { $IDhex = '0' + $IDhex }
         ($IDhex -replace '..', '-$0').substring(1)
     }
+    $last = $end
 
     forEach ($step in 1..$maxBackSteps) {
         $stream.position = $start = $end - $stepSize*$step
@@ -653,30 +622,37 @@ function locateTagsBlock {
                 $first = $buf[$sizepos]
                 if ($first -eq 0 -or $first -eq 0xFF) {
                     continue
-                } else {
-                    $sizelen = 8 - [byte][Math]::floor([Math]::log($first)/[Math]::log(2))
-                    if ($sizepos + $sizelen -ge $buf.length) {
-                        continue
+                }
+                $sizelen = 8 - [byte][Math]::floor([Math]::log($first)/[Math]::log(2))
+                if ($sizepos + $sizelen -ge $buf.length) {
+                    continue
+                }
+                $first = $first -band -bnot (1 -shl (8-$sizelen))
+                $size = if ($sizelen -eq 1) {
+                        $first
+                    } else {
+                        $vint.clear()
+                        $vint[0] = $first
+                        [Buffer]::blockCopy($buf, $sizepos+1, $vint, 1, $sizelen-1)
+                        [Array]::reverse($vint, 0, $sizelen)
+                        [BitConverter]::toUInt64($vint, 0)
                     }
-                    $first = $first -band -bnot (1 -shl (8-$sizelen))
-                    $size = if ($sizelen -eq 1) {
-                            $first
-                        } else {
-                            $vint.clear()
-                            $vint[0] = $first
-                            [Buffer]::blockCopy($buf, $sizepos+1, $vint, 1, $sizelen-1)
-                            [Array]::reverse($vint, 0, $sizelen)
-                            [BitConverter]::toUInt64($vint, 0)
-                        }
-                    if ($start + $sizepos + $sizelen + $size -eq $end) {
-                        $stream.position = $start + $idpos
-                        return $true
-                    }
+                if ($start + $sizepos + $sizelen + $size -ne $last) {
+                    continue
+                }
+                $section = $DTD.Segment._.IDs[$IDhex -replace '-','']
+                if ($section -and $opt.get[$section._.name] -and !$seg.contains($section._.name)) {
+                    $stream.position = $start + $idpos
+                    return $true
+                }
+                if ($last -eq $end) {
+                    $last = $start + $idpos
                 }
             }
         }
     }
-    $stream.position = $meta.datapos + $meta.size
+    $stream.position = if ($last -ne $end) { $last } else { $meta.datapos + $meta.size }
+    return $last -ne $end
 }
 
 #endregion
@@ -851,17 +827,6 @@ function printEntry($entry) {
     if ($meta['skipped']) {
         return
     }
-    if ($opt.printFilter -is [regex]) {
-        if (!$opt.printFilter.match($meta.path).success) {
-            showProgressIfStuck
-            return
-        }
-    } elseif ($opt.printFilter -is [scriptblock]) {
-        if (!(& $opt.printFilter $entry)) {
-            showProgressIfStuck
-            return
-        }
-    }
 
     $last = $state.print
     if ($last['progress']) {
@@ -1004,20 +969,22 @@ function printEntry($entry) {
             return
         }
         '/Tag/$' {
-            $tracks = $meta.closest('Segment').Tracks.TrackEntry
+            $tracks = $meta.closest('Segment')['Tracks']
             $host.UI.write($colors.container, 0, "${indent}Tags ")
 
-            $comma = ''
-            forEach ($UID in $entry.Targets['TagTrackUID']) {
-                if ($trackUID = [array]$tracks.TrackUID -eq $UID) {
-                    $track = $trackUID._.parent
-                    $host.UI.write($colors.normal, 0,
-                        $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
-                    if ($track['Name']) {
-                        $host.UI.write($colors.reference, 0, " ($($track.Name))")
+            if ($tracks) {
+                $comma = ''
+                forEach ($UID in $entry.Targets['TagTrackUID']) {
+                    if ($trackUID = [array]$tracks.TrackEntry.TrackUID -eq $UID) {
+                        $track = $trackUID._.parent
+                        $host.UI.write($colors.normal, 0,
+                            $comma + '#' + $track.TrackNumber + ': ' + $track.TrackType)
+                        if ($track['Name']) {
+                            $host.UI.write($colors.reference, 0, " ($($track.Name))")
+                        }
                     }
+                    $comma = ', '
                 }
-                $comma = ', '
             }
             $host.UI.writeLine()
 
@@ -1142,7 +1109,10 @@ function init {
             ')' +
         ')$|' +
         '/Attachments/AttachedFile/|' +
-        '/Tags/Tag/'
+        '/Tags/Tag/|' +
+        '/SeekHead/|' +
+        '/EBML/|' +
+        '/Void\b'
     )
     $script:numberFormat = [Globalization.CultureInfo]::InvariantCulture
     $script:lookupChunkSize = 512
