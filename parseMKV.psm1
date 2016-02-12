@@ -15,7 +15,7 @@ set-strictMode -version 4
     Input file path
 
 .PARAMETER get
-    Level-1 sections to get, an array of strings.
+    Level-1 sections to get (and 'EBML'), an array of strings.
     Default: 'Info','Tracks','Chapters','Attachments' and additionally 'Tags' when printing.
     '*' means everything, *common' - the four above.
     '*exhaustiveSearch' - in case a block wasn't found automatically it will be searched
@@ -104,7 +104,7 @@ function parseMKV(
                      '*common', <# comprises the next four #>
                      'Info','Tracks','Chapters','Attachments',
                      'Tags','Tags:whenPrinting',
-                     'SeekHead','Cluster','Cues',
+                     'EBML', 'SeekHead','Cluster','Cues',
                      '*exhaustiveSearch')]
     $get = @(
         '*common'
@@ -158,7 +158,7 @@ function parseMKV(
     }
     # less ambiguous local alias
     $opt = @{
-        get = if ('*common' -in $get) { @{Info=1; Tracks=1; Chapters=1; Attachments=1} }
+        get = if ('*common' -in $get) { @{Info='auto'; Tracks='auto'; Chapters='auto'; Attachments='auto'} }
               else { @{} }
         binarySizeLimit = $binarySizeLimit
         print = [bool]$print -or [bool]$printRaw
@@ -166,14 +166,15 @@ function parseMKV(
         showProgress = [bool]$showProgress -or [bool]$print -or [bool]$printRaw
         entryCallback = $entryCallback
     }
-    $get | %{ $opt.get[$_] = $true }
-    $opt.get['/EBML/'] = $opt.get['/Segment/'] = $true
-    if ($opt.print -and $opt.get['Tags:whenPrinting']) {
+    $get | ?{ $_ -match '^\w+$' } | %{ $opt.get[$_] = $true }
+    $opt.get['/EBML/'] = $opt.get['/Segment/'] = $opt.get.SeekHead = 'auto'
+    if ($opt.print -and 'Tags:whenPrinting' -in $get) {
         $opt.get.Tags = $true
     }
     if ('*' -in $get) {
-        $DTD.getEnumerator() | ?{ $_.name -ne '_' } | %{ $opt.get[$_.name] = $true }
-        $DTD.Segment.getEnumerator() | ?{ $_.name -ne '_' } | %{ $opt.get[$_.name] = $true }
+        $DTD, $DTD.Segment | %{
+            $_.getEnumerator() | ?{ $_.name -ne '_' } | %{ $opt.get[$_.name] = 'auto' }
+        }
     }
 
     $mkv = $dummyMeta.PSObject.copy()
@@ -197,6 +198,8 @@ function parseMKV(
         $container = $meta.root = $meta.ref
         $meta.level = 0
         $meta.root = $container
+
+        $seekHead = @{}
 
         if ($entryCallback -and (& $entryCallback $container) -eq 'abort') {
             $state.abort = $true;
@@ -280,35 +283,57 @@ function readChildren($container) {
                 $state.print.postponed = $false
             }
             continue
-        } elseif (!$lastContainerServed -and $meta.name -ne 'Void') {
-            if ($meta.name -eq 'Cluster') {
-                if ($opt.get['*exhaustiveSearch'] -and (locateLastContainer)) {
-                    $lastContainerServed = $true
-                    continue
-                }
-                if (!$opt.get['*exhaustiveSearch']) {
-                    $stream.position = $stopAt
-                    break
+        }
+        if ($lastContainerServed -or $meta.name -eq 'Void') {
+            continue
+        }
+        if ($meta.root.SeekHead) {
+            if (!($requestedSections = $opt.get.getEnumerator().where({ $_.value -eq $true }))) {
+                $stream.position = $stopAt
+                break
+            }
+            $pos = $meta.root._.datapos + $meta.root._.size
+            forEach ($section in $requestedSections.name) {
+                if ($seekHead[$section] -lt $pos -and $seekHead[$section] -gt $meta.datapos) {
+                    $pos = $seekHead[$section]
                 }
             }
-            if ($opt.showProgress -and ([datetime]::now.ticks - $state.print['progresstick'] -ge 1000000)) {
-                showProgressIfStuck
+            $stream.position = $pos
+            continue
+        }
+        if ($meta.name -eq 'Cluster' -and !$opt.get['Cluster']) {
+            if (($opt.get['*exhaustiveSearch'] -or ($opt.get.values -eq $true)) `
+            -and (locateLastContainer)) {
+                $lastContainerServed = $true
+                continue
+            }
+            if (!$opt.get['*exhaustiveSearch']) {
+                $stream.position = $stopAt
+                break
             }
         }
+        if ($opt.showProgress -and ([datetime]::now.ticks - $state.print['progresstick'] -ge 1000000)) {
+            showProgressIfStuck
+        }
     }
+
+    if ($container._.name -eq 'SeekHead') {
+        $heads = [ordered]@{}
+        $segdatapos = $container._.root._.datapos
+        forEach ($seek in $container.Seek) {
+            if ($section = $DTD.Segment._.IDs[(bin2hex $seek.SeekID)]) {
+                $heads[$section._.name] = $seekHead[$section._.name] = $segdatapos + $seek.SeekPosition
+            }
+        }
+        add-member $heads -inputObject $container._.parent.SeekHead
+    }
+
     makeSingleParentsTransparent $container
+
     if ($opt.print -and !$state.abort -and !$state.print['postponed']) {
         printChildren $container
     } elseif ($opt.showProgress -and ([datetime]::now.ticks - $state.print['progresstick'] -ge 1000000)) {
         showProgressIfStuck
-    }
-    if ($container._.level -le 1) {
-        $name = if ($container._.level) { $container._.name } else { $container._.path }
-        $opt.get.remove($name)
-        # when all level-1 sections are done purge the list so locateLastContainer won't be needlessly invoked
-        if ($opt.get.count -eq 1 -and $opt.get[0] -eq '/Segment/') {
-            $opt.get.clear()
-        }
     }
 }
 
@@ -486,7 +511,7 @@ function readEntry($container) {
                     $value = [Text.Encoding]::UTF8.getString($bin.readBytes($size))
                 }
                 'binary' {
-                    $readSize = if ($opt.binarySizeLimit -lt 0) { $size }
+                    $readSize = if ($opt.binarySizeLimit -lt 0 -or $meta.name -eq 'SeekID') { $size }
                                 else { [Math]::min($opt.binarySizeLimit, $size) }
                     if ($readSize) {
                         $value = $bin.readBytes($readSize)
@@ -598,8 +623,7 @@ function readEntry($container) {
 }
 
 function locateLastContainer {
-    $seg = $meta.closest('Segment')
-    [uint64]$end = $seg._.datapos + $seg._.size
+    [uint64]$end = $meta.root._.datapos + $meta.root._.size
 
     $maxBackSteps = [int]0x100000 / $lookupChunkSize # max 1MB
 
@@ -838,7 +862,7 @@ function printEntry($entry) {
     }
 
     function listTracksFor([string[]]$IDs, [string]$IDname) {
-        $tracks = $meta.closest('Segment')['Tracks']
+        $tracks = $meta.root['Tracks']
         if (!$tracks) {
             return
         }
@@ -1068,7 +1092,7 @@ function showProgressIfStuck {
     }
     $state.print.progresstick = $tick
     if ($meta.path -match '/Cluster/') {
-        $section = $meta.closest('Segment')
+        $section = $meta.root
     } else {
         $section = $meta.closest('','/Segment/\w+/$')
     }
