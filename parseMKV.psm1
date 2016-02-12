@@ -197,9 +197,7 @@ function parseMKV(
 
         $container = $meta.root = $meta.ref
         $meta.level = 0
-        $meta.root = $container
-
-        $seekHead = @{}
+        $meta.root = $segment = $container
 
         if ($entryCallback -and (& $entryCallback $container) -eq 'abort') {
             $state.abort = $true;
@@ -287,15 +285,17 @@ function readChildren($container) {
         if ($lastContainerServed -or $meta.name -eq 'Void') {
             continue
         }
-        if ($meta.root.SeekHead) {
+        if ($segment.SeekHead) {
             if (!($requestedSections = $opt.get.getEnumerator().where({ $_.value -eq $true }))) {
                 $stream.position = $stopAt
                 break
             }
-            $pos = $meta.root._.datapos + $meta.root._.size
+            $pos = $segment._.datapos + $segment._.size
             forEach ($section in $requestedSections.name) {
-                if ($seekHead[$section] -lt $pos -and $seekHead[$section] -gt $meta.datapos) {
-                    $pos = $seekHead[$section]
+                if ($p = $segment.SeekHead.named[$section]) {
+                    if ($p -lt $pos -and $p -gt $meta.datapos) {
+                        $pos = $p
+                    }
                 }
             }
             $stream.position = $pos
@@ -318,13 +318,14 @@ function readChildren($container) {
     }
 
     if ($container._.name -eq 'SeekHead') {
-        $segdatapos = $container._.root._.datapos
+        if (!$segment.SeekHead.PSObject.properties['named']) {
+            add-member named @{} -inputObject $segment.SeekHead
+        }
         forEach ($seek in $container.Seek) {
             if ($section = $DTD.Segment._.IDs[(bin2hex $seek.SeekID)]) {
-                $seekHead[$section._.name] = $segdatapos + $seek.SeekPosition
+                $segment.SeekHead.named[$section._.name] = $segment._.datapos + $seek.SeekPosition
             }
         }
-        add-member named $seekHead -inputObject $container._.parent.SeekHead
     }
 
     makeSingleParentsTransparent $container
@@ -622,7 +623,7 @@ function readEntry($container) {
 }
 
 function locateLastContainer {
-    [uint64]$end = $meta.root._.datapos + $meta.root._.size
+    [uint64]$end = $segment._.datapos + $segment._.size
 
     $maxBackSteps = [int]0x100000 / $lookupChunkSize # max 1MB
 
@@ -861,7 +862,7 @@ function printEntry($entry) {
     }
 
     function listTracksFor([string[]]$IDs, [string]$IDname) {
-        $tracks = $meta.root['Tracks']
+        $tracks = $segment['Tracks']
         if (!$tracks) {
             return
         }
@@ -1090,7 +1091,7 @@ function showProgressIfStuck {
     }
     $state.print.progresstick = $tick
     if ($meta.path -match '/Cluster/') {
-        $section = $meta.root
+        $section = $segment
     } else {
         $section = $meta.closest('','/Segment/\w+/$')
     }
