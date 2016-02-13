@@ -38,6 +38,12 @@ set-strictMode -version 4
 .PARAMETER print
     Pretty-print to the console.
 
+.PARAMETER printRaw
+    Print the element tree as is.
+
+.PARAMETER showProgress
+    Show the progress for long operations even when not printing.
+
 .EXAMPLE
     parseMKV 'c:\some\path\file.mkv' -print
 
@@ -214,7 +220,7 @@ function parseMKV(
         $bin.close()
     }
     if ($opt.print) {
-        if (!$state.print['omitLineFeed']) {
+        if ($state.print['needLineFeed']) {
             $host.UI.writeLine()
         }
         if ($state.print['progress']) {
@@ -901,10 +907,10 @@ function printEntry($entry) {
             $host.UI.writeLine($colors.dim, 0,
                 " [$($last.skipped) entries skipped, $((prettySize $last.skippedSize) -join '')]")
             $last.skipped = $last.skippedSize = 0
-        } elseif (!$last['omitLineFeed']) {
+        } elseif ($last['needLineFeed']) {
             $host.UI.writeLine()
         } else {
-            $last['omitLineFeed'] = $false
+            $last['needLineFeed'] = $true
         }
     }
     $last.path = $meta.path
@@ -914,6 +920,7 @@ function printEntry($entry) {
     $indent = '  '*$meta.level
 
     if (!$opt.printRaw) {
+      $last['needLineFeed'] = $false
       switch -regex ($meta.path) {
         '^/Segment/$' {
             if (($i = $meta.parent.Segment.count) -gt 1) {
@@ -976,6 +983,7 @@ function printEntry($entry) {
             if ($name) {
                 $host.UI.write($colors.string, 0, $name + ' ')
             }
+            $host.UI.writeLine()
             return
         }
         '/ChapterAtom/$' {
@@ -1003,6 +1011,16 @@ function printEntry($entry) {
                     $host.UI.write($colors[@('string','normal','dim')[$color]], 0, $display.ChapString)
                 }
             }
+            $host.UI.writeLine()
+            if ($UID = $entry['ChapterSegmentUID']) {
+                if ($end = $entry['ChapterTimeEnd']) {
+                    $s = "${indent}        $($end._.displayString) "
+                } else {
+                    $s = "${indent}    "
+                }
+                $host.UI.write($colors.normal, 0, $s)
+                $host.UI.writeLine($colors.dim, 0, "UID: $(bin2hex $UID)")
+            }
             return
         }
         '/EditionEntry/$' {
@@ -1013,6 +1031,7 @@ function printEntry($entry) {
             if (($flags -join '')) {
                 $host.UI.write($colors.value, 0, $flags)
             }
+            $host.UI.writeLine()
             return
         }
         '/AttachedFile/FileName$' {
@@ -1022,7 +1041,7 @@ function printEntry($entry) {
             $s, $alt = prettySize $att.FileData._.size
             $host.UI.write($colors[@('value','dim')[[int]!$alt]], 0, $s)
             $host.UI.write($colors.dim, 0, $alt)
-            $host.UI.write($colors.stringdim, 0, $att['FileDescription'])
+            $host.UI.writeLine($colors.stringdim, 0, $att['FileDescription'])
             return
         }
         '/Tag/$' {
@@ -1030,7 +1049,7 @@ function printEntry($entry) {
             listTracksFor $entry.Targets['TagTrackUID'] 'TrackUID'
             $host.UI.writeLine()
             printSimpleTags $entry
-            $host.UI.writeLine()
+            $host.UI.writeLine("`n")
             return
         }
         '/CuePoint/$' {
@@ -1046,17 +1065,15 @@ function printEntry($entry) {
                 listTracksFor @($cue.CueTrack) 'TrackNumber'
                 $host.UI.writeLine()
             }
-            $last.omitLineFeed = $true
+            $host.UI.writeLine()
             return
         }
         '/Info/(DateUTC|(Muxing|Writing)App)$' {
             if ($meta.parent['MuxingApp'] -eq 'no_variable_data') {
-                $last.omitLineFeed = $true
                 return
             }
         }
         $printPretty {
-            $last.omitLineFeed = $true
             return
         }
         '^/Segment/\w+/$' {
@@ -1081,6 +1098,7 @@ function printEntry($entry) {
     $color = if ($meta.name -match 'UID$') { 'dim' }
              else { switch ($meta.type) { string { 'string' } binary { 'dim' } default { 'value' } } }
     $host.UI.write($colors[$color], 0, $s)
+    $last.needLineFeed = $true
 }
 
 function showProgressIfStuck {
