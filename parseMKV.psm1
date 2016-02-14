@@ -139,7 +139,7 @@ function parseMKV(
         [scriptblock]
     $entryCallback
 ) {
-
+process {
     if (!(test-path -literal $filepath)) {
         $filepath = "$(gi $filepath)"
     }
@@ -236,6 +236,7 @@ function parseMKV(
 
     makeSingleParentsTransparent $mkv
     $mkv
+}
 }
 
 #region MAIN
