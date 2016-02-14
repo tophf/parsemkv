@@ -1045,7 +1045,9 @@ function printEntry($entry) {
                     $host.UI.write($colors.dim, 0, ' ')
                 }
                 $lng = $display['ChapLanguage']
-                if (!$lng) { $lng = $DTD.Segment.Chapters.ChapterDisplay.ChapLanguage._.value }
+                if (!$lng) {
+                    $lng = $DTD.Segment.Chapters.EditionEntry.ChapterAtom.ChapterDisplay.ChapLanguage._.value
+                }
                 if ($lng -and $lng -ne 'und') {
                     $host.UI.write($colors.dim, 0, $lng.trim() + '/')
                 }
