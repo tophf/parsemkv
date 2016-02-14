@@ -204,6 +204,7 @@ function parseMKV(
         $container = $meta.root = $meta.ref
         $meta.level = 0
         $meta.root = $segment = $container
+        $allSeekHeadsFound = $false
 
         if ($entryCallback -and (& $entryCallback $container) -eq 'abort') {
             $state.abort = $true;
@@ -291,17 +292,23 @@ function readChildren($container) {
         if ($lastContainerServed -or $meta.name -eq 'Void') {
             continue
         }
-        if ($segment.SeekHead) {
+        if ($segment['SeekHead']) {
             if (!($requestedSections = $opt.get.getEnumerator().where({ $_.value -eq $true }))) {
                 $stream.position = $stopAt
                 break
             }
             $pos = $segment._.datapos + $segment._.size
             forEach ($section in $requestedSections.name) {
-                if ($p = $segment.SeekHead.named[$section]) {
-                    if ($p -lt $pos -and $p -gt $meta.datapos) {
-                        $pos = $p
+                $p = $segment.SeekHead.named[$section]
+                if (!$p -and !$allSeekHeadsFound) {
+                    $allSeekHeadsFound = $true
+                    if ($segment.SeekHead.named['SeekHead']) {
+                        processSeekHead -findAll
+                        $p = $segment.SeekHead.named[$section]
                     }
+                }
+                if ($p -lt $pos -and $p -gt $meta.datapos) {
+                    $pos = $p
                 }
             }
             $stream.position = $pos
@@ -324,14 +331,7 @@ function readChildren($container) {
     }
 
     if ($container._.name -eq 'SeekHead') {
-        if (!$segment.SeekHead.PSObject.properties['named']) {
-            add-member named @{} -inputObject $segment.SeekHead
-        }
-        forEach ($seek in $container.Seek) {
-            if ($section = $DTD.Segment._.IDs[(bin2hex $seek.SeekID)]) {
-                $segment.SeekHead.named[$section._.name] = $segment._.datapos + $seek.SeekPosition
-            }
-        }
+        processSeekHead $container
     }
 
     makeSingleParentsTransparent $container
@@ -637,6 +637,7 @@ function locateLastContainer {
         # do nothing if the stream's end is near
         return
     }
+
     $vint = [byte[]]::new(8)
     $IDs = 'Tags','SeekHead','Cluster','Cues','Chapters','Attachments','Tracks','Info' | %{
         $IDhex = $DTD.Segment[$_]._.id.toString('X')
@@ -697,6 +698,40 @@ function locateLastContainer {
     }
     $stream.position = if ($last -ne $end) { $last } else { $meta.datapos + $meta.size }
     return $last -ne $end
+}
+
+function processSeekHead($SeekHead = $segment.SeekHead, [switch]$findAll) {
+    $SeekHead, $segment.SeekHead | %{
+        if (!$_.PSObject.properties['named']) {
+            add-member named @{} -inputObject $_
+        }
+    }
+
+    $savedPos = $stream.position
+    $moreHeads = [Collections.ArrayList] @()
+
+    forEach ($seek in $SeekHead.Seek) {
+        if ($section = $DTD.Segment._.IDs[(bin2hex $seek.SeekID)]) {
+            $pos = $segment._.datapos + $seek.SeekPosition
+            if ($section._.name -eq 'SeekHead') {
+                if (!$moreHeads.contains($pos)) {
+                    $moreHeads.add($pos) >$null
+                }
+            } else {
+                $SeekHead.named, $segment.SeekHead.named | %{ $_[$section._.name] = $pos }
+            }
+        }
+    }
+
+    if ([bool]$findAll) {
+        forEach ($pos in $moreHeads) {
+            $stream.position = $pos
+            if ($meta = readEntry $segment) {
+                readChildren $meta.ref
+            }
+        }
+        $stream.position = $savedPos
+    }
 }
 
 #endregion
