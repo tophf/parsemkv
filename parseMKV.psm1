@@ -18,7 +18,9 @@ set-strictMode -version 4
     Level-1 sections to get (and 'EBML'), an array of strings.
     Default: 'Info','Tracks','Chapters','Attachments' and additionally 'Tags' when printing.
     '*' means everything, *common' - the four above.
-    '*exhaustiveSearch' - in case a block wasn't found automatically it will be searched
+
+.PARAMETER exhaustiveSearch
+    In case a block wasn't found automatically it will be searched
     by sequentially skipping all [usually Cluster] elements which may take a long time
 
 .PARAMETER binarySizeLimit
@@ -110,12 +112,14 @@ function parseMKV(
                      '*common', <# comprises the next four #>
                      'Info','Tracks','Chapters','Attachments',
                      'Tags','Tags:whenPrinting',
-                     'EBML', 'SeekHead','Cluster','Cues',
-                     '*exhaustiveSearch')]
+                     'EBML', 'SeekHead','Cluster','Cues')]
     $get = @(
         '*common'
         'Tags:whenPrinting'
     ),
+
+        [switch]
+    $exhaustiveSearch,
 
         [int32] [validateRange(-1, [int32]::MaxValue)]
     $binarySizeLimit = 16,
@@ -166,6 +170,7 @@ function parseMKV(
     $opt = @{
         get = if ('*common' -in $get) { @{Info='auto'; Tracks='auto'; Chapters='auto'; Attachments='auto'} }
               else { @{} }
+        exhaustiveSearch = [bool]$exhaustiveSearch
         binarySizeLimit = $binarySizeLimit
         print = [bool]$print -or [bool]$printRaw
         printRaw = [bool]$printRaw
@@ -315,12 +320,14 @@ function readChildren($container) {
             continue
         }
         if ($meta.name -eq 'Cluster' -and !$opt.get['Cluster']) {
-            if (($opt.get['*exhaustiveSearch'] -or ($opt.get.values -eq $true)) `
-            -and (locateLastContainer)) {
+            # here we don't need clusters and we don't have SeekHead
+            # so in case more explicitly requested sections are needed
+            # we'll try locating them at the end of the file
+            if (($opt['exhaustiveSearch'] -or ($opt.get.values -eq $true)) -and (locateLastContainer)) {
                 $lastContainerServed = $true
                 continue
             }
-            if (!$opt.get['*exhaustiveSearch']) {
+            if (!$opt['exhaustiveSearch']) {
                 $stream.position = $stopAt
                 break
             }
