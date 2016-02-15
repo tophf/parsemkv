@@ -99,6 +99,28 @@ set-strictMode -version 4
         " - " + $chapter._.find('ChapString')
     }
 
+.EXAMPLE
+    Getting a list of video keyframes via -entryCallback parameter
+
+    $keyframes = {}.invoke() # create an empty Collections`1 object
+    $currentBlock = 0
+
+    parseMKV 'c:\some\path\file.mkv' -get Info,Tracks,Cluster -showProgress -entryCallback {
+        param($entry)
+
+        if ($entry._.name -eq 'SimpleBlock' `
+        -and ($entry[0] -band 0x7F) -eq $entry._.root.Tracks.Video.TrackNumber) {
+
+            if ($entry[3] -ge 0x80) {
+                $keyframes.add($currentBlock)
+            }
+
+            $script:currentBlock++
+        }
+    }
+
+    $keyframes -join "`n" | out-file r:\kf.txt ASCII
+
 #>
 
 function parseMKV(
@@ -175,7 +197,6 @@ process {
         print = [bool]$print -or [bool]$printRaw
         printRaw = [bool]$printRaw
         showProgress = [bool]$showProgress -or [bool]$print -or [bool]$printRaw
-        entryCallback = $entryCallback
     }
     $get | ?{ $_ -match '^\w+$' } | %{ $opt.get[$_] = $true }
     $opt.get['/EBML/'] = $opt.get['/Segment/'] = $opt.get.SeekHead = 'auto'
@@ -273,7 +294,7 @@ function readChildren($container) {
 
         $child = $meta.ref
 
-        if ($opt.entryCallback -and (& $opt.entryCallback $child) -eq 'abort') {
+        if ($entryCallback -and (& $entryCallback $child) -eq 'abort') {
             $state.abort = $true
             break
         }
