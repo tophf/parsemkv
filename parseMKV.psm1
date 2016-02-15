@@ -722,7 +722,8 @@ function processSeekHead($SeekHead = $segment.SeekHead, [switch]$findAll) {
         if ($section = $DTD.Segment._.IDs[(bin2hex $seek.SeekID)]) {
             $pos = $segment._.datapos + $seek.SeekPosition
             if ($section._.name -eq 'SeekHead') {
-                if (!$moreHeads.contains($pos)) {
+                # skip SeekHead if it's already been read
+                if ($segment.SeekHead._.pos -notcontains $pos) {
                     $moreHeads.add($pos) >$null
                 }
             } else {
