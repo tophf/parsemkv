@@ -170,7 +170,7 @@ process {
             $filepath,
             [IO.FileMode]::open,
             [IO.FileAccess]::read,
-            [IO.FileShare]::read,
+            [IO.FileShare]::readWrite,
             16, # by default read-ahead is 4096 and we don't need that after every seek
             [IO.FileOptions]::RandomAccess
         )
