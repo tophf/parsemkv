@@ -1211,8 +1211,13 @@ function getMKVkeyframes([string]$filepath) {
     parseMKV $filepath -showProgress -keepStreamOpen -entryCallback {
         param($entry)
 
-        if ($entry._.name -ne 'Cluster') {
-            return
+        switch ($entry._.name) {
+            'Cluster' {}
+            'DocTypeVersion' {
+                if ($entry -lt 2) { return 'abort' }
+                return
+            }
+            default { return }
         }
 
         $bin = $entry._.root._.parent.reader
