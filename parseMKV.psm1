@@ -282,7 +282,7 @@ function findNextRootContainer {
 
 function readChildren($container) {
     $stream.position = $container._.datapos
-    $stopAt = $container._.datapos + $container._.size
+    $stopAt = if ($container._.size) { $container._.datapos + $container._.size } else { $stream.length }
     $lastContainerServed = $false
 
     while ($stream.position -lt $stopAt -and !$state.abort) {
@@ -456,7 +456,9 @@ function readEntry($container) {
         } else {
             $VINT.clear()
             $VINT[0] = $first = $bin.readByte()
-            if ($first -ge 0x80) {
+            if ($first -eq 0xFF) {
+                $null # unknown size, usually streamed content or dynamically written
+            } elseif ($first -ge 0x80) {
                 $first -band 0x7F
             } elseif ($first -ge 0x40) {
                 ([int]$first -band 0x3F) -shl 8 -bor $bin.readByte()
