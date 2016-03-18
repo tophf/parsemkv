@@ -1229,39 +1229,32 @@ function getMKVkeyframes([string]$filepath) {
         $VINT = [byte[]]::new(8)
 
         $clusterID = $DTD.Segment.Cluster._.id
-        $clusterIDbytes = [BitConverter]::getBytes($clusterID)
-        $clusterIDfirstByte = $clusterIDbytes[-1]
-        $clusterIDlen = $clusterIDbytes.count
+        $simpleBlockID = $DTD.Segment.Cluster.SimpleBlock._.id
+        $blockGroupID = $DTD.Segment.Cluster.BlockGroup._.id
+        $blockID = $DTD.Segment.Cluster.BlockGroup.Block._.id
 
-        $blockID = $DTD.Segment.Cluster.SimpleBlock._.id
         $curBlock = 0
 
         while ($stream.position -lt $stream.length) {
-
             # read ID
             $VINT.clear()
             $b = $VINT[0] = $bin.readByte()
-            $gotCluster = $false
-            $gotBlock = $b -eq $blockID
-            if (!$gotBlock) {
+            if ($b -ge 0x80) {
+                $id = $b
+            } else {
                 $len = 8 - [byte][Math]::floor([Math]::log($b)/[Math]::log(2))
-                # maybe next Cluster
-                if ($b -eq $clusterIDfirstByte -and $len -eq $clusterIDlen) {
-                    $bin.read($VINT, 1, $clusterIDlen - 1) >$null
-                    [Array]::reverse($VINT, 0, $clusterIDlen)
-                    $gotCluster = [BitConverter]::toUInt64($VINT, 0) -eq $clusterID
-                } elseif ($len -gt 1) {
-                    $stream.position += $len - 1
-                }
+                $bin.read($VINT, 1, $len - 1) >$null
+                [Array]::reverse($VINT, 0, $len)
+                $id = [BitConverter]::toUInt64($VINT, 0)
             }
 
             # read size
             $VINT.clear()
             $b = $VINT[0] = $bin.readByte()
-            $len = 8 - [byte][Math]::floor([Math]::log($b)/[Math]::log(2))
-            if ($len -eq 1) {
+            if ($b -ge 0x80) {
                 $size = $b -band 0x7F
             } else {
+                $len = 8 - [byte][Math]::floor([Math]::log($b)/[Math]::log(2))
                 $VINT[0] = $b -band -bnot (1 -shl (8-$len))
                 $bin.read($VINT, 1, $len - 1) >$null
                 [Array]::reverse($VINT, 0, $len)
@@ -1269,26 +1262,23 @@ function getMKVkeyframes([string]$filepath) {
             }
             $datapos = $stream.position
 
-            if ($gotBlock) {
-                if ($bin.readByte() -eq $vidtrackVINT) {
-                    $stream.position += 2
+            if ($id -eq $blockID) {
+                $curBlock++
+            } elseif ($id -eq $simpleBlockID -and $bin.readByte() -eq $vidtrackVINT) {
+                $stream.position += 2
+                if ($bin.readByte() -ge 0x80) {
+                    $keyframes.add($curBlock)
 
-                    if ($bin.readByte() -ge 0x80) {
-                        $keyframes.add($curBlock)
-
-                        $progress = [Math]::max(0.000001, $stream.position / $stream.length)
-                        $elapsed = ([datetime]::now.ticks - $tick0)/10000000
-                        $remaining = $elapsed / $progress - $elapsed + 0.5
-                        write-progress 'Keyframes' -status "Frame $curBlock" -percent ($progress * 100) -seconds $remaining
-                    }
-                    $curBlock++
+                    $progress = [Math]::max(0.000001, $stream.position / $stream.length)
+                    $elapsed = ([datetime]::now.ticks - $tick0)/10000000
+                    $remaining = $elapsed / $progress - $elapsed + 0.5
+                    write-progress 'Keyframes' -status "Frame $curBlock" -percent ($progress * 100) -seconds $remaining
                 }
+                $curBlock++
             }
 
-            $stream.position = if ($gotCluster) { $datapos } else { $datapos + $size }
+            $stream.position = if ($clusterID, $blockGroupID -eq $id) { $datapos } else { $datapos + $size }
         }
-
-        'abort'
     } >$null
 
     write-progress 'Keyframes' -completed
