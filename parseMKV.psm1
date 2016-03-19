@@ -294,9 +294,11 @@ function readChildren($container) {
 
         $child = $meta.ref
 
-        if ($entryCallback -and (& $entryCallback $child) -eq 'abort') {
-            $state.abort = $true
-            break
+        if ($entryCallback) {
+            switch (& $entryCallback $child) {
+                'abort' { $state.abort = $true; break }
+                'skip'  { $meta.skipped = $true }
+            }
         }
         if (!$meta['skipped']) {
             if ($meta.type -ne 'container') {
@@ -314,7 +316,13 @@ function readChildren($container) {
                 printChildren $child -includeContainers
                 $state.print.postponed = $false
             }
+            if ($meta.level -eq 1 -and $DTD.Segment[$meta.name] -and !$DTD.Segment[$meta.name]._['multiple']) {
+                $opt.get.remove($meta.name)
+            }
             continue
+        }
+        if ($meta.level -eq 1 -and $DTD.Segment[$meta.name] -and !$DTD.Segment[$meta.name]._['multiple']) {
+            $opt.get.remove($meta.name)
         }
         if ($lastContainerServed -or $meta.name -eq 'Void') {
             continue
@@ -323,6 +331,9 @@ function readChildren($container) {
             if (!($requestedSections = $opt.get.getEnumerator().where({ $_.value -eq $true }))) {
                 $stream.position = $stopAt
                 break
+            }
+            if ($meta.name -ne 'Cluster' -and $requestedSections.name -eq 'Cluster') {
+                continue
             }
             $pos = $segment._.datapos + $segment._.size
             forEach ($section in $requestedSections.name) {
