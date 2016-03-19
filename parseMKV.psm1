@@ -130,11 +130,13 @@ function parseMKV(
     $filepath,
 
         [string[]]
-        [validateSet('*',
-                     '*common', <# comprises the next four #>
-                     'Info','Tracks','Chapters','Attachments',
-                     'Tags','Tags:whenPrinting',
-                     'EBML', 'SeekHead','Cluster','Cues')]
+        [validateSet(
+            '*', <# tries to get everything except keyframes/timecodes #>
+            '*common', <# is the next 4 #> 'Info','Tracks','Chapters','Attachments',
+            'Tags','Tags:whenPrinting',
+            'EBML', 'SeekHead','Cluster','Cues',
+            'keyframes', 'timecodes'
+        )]
     $get = @(
         '*common'
         'Tags:whenPrinting'
@@ -190,24 +192,29 @@ process {
     }
     # less ambiguous local alias
     $opt = @{
-        get = if ('*common' -in $get) { @{Info='auto'; Tracks='auto'; Chapters='auto'; Attachments='auto'} }
-              else { @{} }
+        get = @{ EBML='auto'; Segment='auto'; SeekHead='auto' }
         exhaustiveSearch = [bool]$exhaustiveSearch
         binarySizeLimit = $binarySizeLimit
         print = [bool]$print -or [bool]$printRaw
         printRaw = [bool]$printRaw
         showProgress = [bool]$showProgress -or [bool]$print -or [bool]$printRaw
     }
-    $get | ?{ $_ -match '^\w+$' } | %{ $opt.get[$_] = $true }
-    $opt.get.EBML = $opt.get.Segment = $opt.get.SeekHead = 'auto'
-    if ($opt.print -and 'Tags:whenPrinting' -in $get) {
-        $opt.get.Tags = $true
-    }
     if ('*' -in $get) {
         $DTD, $DTD.Segment | %{
             $_.getEnumerator() | ?{ $_.name -ne '_' } | %{ $opt.get[$_.name] = 'auto' }
         }
     }
+    if ('*common' -in $get) {
+        'Info', 'Tracks', 'Chapters', 'Attachments' | %{ $opt.get[$_] = 'auto' }
+    }
+    if ('keyframes' -in $get -or 'timecodes' -in $get) {
+        $opt.get.Info = $opt.get.Tracks = $true
+        $opt.get.KFTC = $opt.get.Cluster = 'find'
+    }
+    if ($opt.print -and 'Tags:whenPrinting' -in $get) {
+        $opt.get.Tags = $true
+    }
+    $get | ?{ $_ -match '^\w+$' } | %{ $opt.get[$_] = $true }
 
     $mkv = $dummyMeta.PSObject.copy()
     $mkv.PSObject.members.remove('closest')
@@ -233,7 +240,7 @@ process {
         $allSeekHeadsFound = $false
 
         if ($entryCallback -and (& $entryCallback $container) -eq 'abort') {
-            $state.abort = $true;
+            $state.abort = $true
             break
         }
         if ($opt.print) {
@@ -241,6 +248,12 @@ process {
         }
 
         readChildren $container
+    }
+
+    if ($opt.get['KFTC'] -and !$state.abort `
+    -and !$mkv['keyframes'] -and !$mkv['timecodes'] `
+    -and $mkv.Segment -and $mkv.Segment[0]['Cluster']) {
+        indexMKV
     }
 
     if (![bool]$keepStreamOpen) {
@@ -281,6 +294,14 @@ function findNextRootContainer {
 }
 
 function readChildren($container) {
+
+    function gotLevel1 {
+        if ($DTD.Segment[$meta.name] -and !$DTD.Segment[$meta.name]._['multiple']) {
+            $opt.get.remove($meta.name)
+        }
+    }
+
+    $stream = $stream
     $stream.position = $container._.datapos
     $stopAt = if ($container._.size) { $container._.datapos + $container._.size } else { $stream.length }
     $lastContainerServed = $false
@@ -310,19 +331,15 @@ function readChildren($container) {
                 printChildren $child -includeContainers
                 $state.print.postponed = $false
             }
-            if ($meta.level -eq 1 -and $DTD.Segment[$meta.name] -and !$DTD.Segment[$meta.name]._['multiple']) {
-                $opt.get.remove($meta.name)
-            }
+            if ($meta.level -eq 1) { gotLevel1 }
             continue
         }
-        if ($meta.level -eq 1 -and $DTD.Segment[$meta.name] -and !$DTD.Segment[$meta.name]._['multiple']) {
-            $opt.get.remove($meta.name)
-        }
+        if ($meta.level -eq 1) { gotLevel1 }
         if ($lastContainerServed -or $meta.name -eq 'Void') {
             continue
         }
         if ($segment['SeekHead']) {
-            if (!($requestedSections = $opt.get.getEnumerator().where({ $_.value -eq $true }))) {
+            if (!($requestedSections = $opt.get.getEnumerator().where({ [string]$_.value -ne 'auto' }))) {
                 $stream.position = $stopAt
                 break
             }
@@ -414,6 +431,8 @@ function readEntry($container, $stopAt) {
     # inlining because PowerShell's overhead for a simple function call
     # is bigger than the time to execute it
 
+    $bin = $bin
+    $stream = $stream
     $VINT = [byte[]]::new(8)
     $globalIDs = $DTD._.globalIDs
     $pathIDs = $DTD._.pathIDs
@@ -488,7 +507,6 @@ function readEntry($container, $stopAt) {
 
         if (!$info) {
             $stream.position += $size
-            $state.abort = $entryCallback -and (& $entryCallback $meta.ref) -eq 'abort'
             return $meta
         }
 
@@ -496,12 +514,16 @@ function readEntry($container, $stopAt) {
         $meta.root = $parentMeta['root']
         $meta.parent = $container
 
-        if ((($type -eq 'container' -and $meta.level -eq 1) -or $name -eq 'Void') -and !$opt.get[$meta.name]) {
+        if ((($type -eq 'container' -and $meta.level -eq 1) -or $name -eq 'Void') -and !$opt.get[$name]) {
             $stream.position += $size
             $meta.ref = [ordered]@{ _=$meta }
             $meta.skipped = $true
             $state.abort = $entryCallback -and (& $entryCallback $meta.ref) -eq 'abort'
             return $meta
+        }
+
+        if ($opt.get['KFTC'] -and $name -eq 'Cluster' -and $opt.get.Cluster -ne $true) {
+            $meta.skipped = $true
         }
 
         if ($type -eq 'container') {
@@ -1216,42 +1238,35 @@ function showProgressIfStuck {
 }
 
 #endregion
-#region KEYFRAMES
+#region INDEXING
 
-function getMKVkeyframes([string]$filepath) {
-    $keyframes = [Collections.ArrayList]::new()
-    $tick0 = [datetime]::now.ticks
-
-    $mkv = parseMKV $filepath -get Info,Tracks,Cluster -keepStreamOpen -entryCallback {
-        if ($args[0]._.name -eq 'Cluster') { 'abort' }
-    }
-    if (!$mkv -or !$mkv.Segment[0]['Cluster']) {
-        return
-    }
-
-    $bin = $mkv.reader
-    $stream = $bin.baseStream
-
+function indexMKV {
+    $bin = $bin
+    $stream = $stream
     $VINT = [byte[]]::new(8)
     $vidtrackVINT = $mkv.Segment[0].Tracks.Video.TrackNumber -bor 0x80
 
-    $DTDseg = $mkv.DTD.Segment
-    $IDs = @{
-        Cluster = $DTDseg.Cluster._.id
-        SimpleBlock = $DTDseg.Cluster.SimpleBlock._.id
-        BlockGroup = $DTDseg.Cluster.BlockGroup._.id
-        Block = $DTDseg.Cluster.BlockGroup.Block._.id
-        ReferenceBlock = $DTDseg.Cluster.BlockGroup.ReferenceBlock._.id
-        CuePoint = $DTDseg.Cues.CuePoint._.id
-        CueTime = $DTDseg.Cues.CuePoint.CueTime._.id
-    }
+    $getKF = $opt.get['keyframes']
+    $getTC = $opt.get['timecodes']
+    $timecodes = [Collections.Generic.SortedList[uint64,int]]::new()
+    $keyframes = [Collections.ArrayList]::new()
+
+    $DTDcluster = $DTD.Segment.Cluster
+    $IDCluster = $DTDcluster._.id
+    $IDTimecode = $DTDcluster.Timecode._.id
+    $IDSimpleBlock = $DTDcluster.SimpleBlock._.id
+    $IDBlockGroup = $DTDcluster.BlockGroup._.id
+    $IDBlock = $DTDcluster.BlockGroup.Block._.id
+    $IDReferenceBlock = $DTDcluster.BlockGroup.ReferenceBlock._.id
 
     $curBlock = 0
-    $blockGroup = @{
-        video = @{ end = [uint64]::maxValue; reference = $false }
-    }
+    $blockGroupVideoEnd = [uint64]::maxValue
+    $blockGroupVideoRef = $false
+    $clusterTime = 0
 
-    $stream.position = $mkv.Segment.Cluster._.datapos
+    $tick0 = [datetime]::now.ticks
+    $stream.position = $mkv.Segment[0].Cluster[0]._.datapos
+
     while ($stream.position -lt $stream.length) {
         # read ID
         $VINT.clear()
@@ -1279,49 +1294,132 @@ function getMKVkeyframes([string]$filepath) {
 
         $datapos = $stream.position
 
-        switch ($id) {
-            $IDs.Block {
-                if ($bin.readByte() -eq $vidtrackVINT) {
-                    $curBlock++
-                    $blockGroup.video = $blockGroup.current
+        if ($id -eq $IDBlock) {
+            $bin.read($VINT, 0, 4) >$null
+            if ($VINT[0] -eq $vidtrackVINT) {
+                $blockGroupVideoEnd = $blockGroupEnd
+                $blockGroupVideoRef = $blockGroupRef
+
+                if ($getTC) {
+                    [Array]::reverse($VINT, 1, 2)
+                    $timecodes[$clusterTime + [BitConverter]::toInt16($VINT, 1)] = 0
                 }
-            }
-            $IDs.ReferenceBlock {
-                $blockGroup.current.reference = $true
-            }
-            $IDs.SimpleBlock {
-                if ($bin.readByte() -eq $vidtrackVINT) {
-                    $stream.position += 2
-                    if ($bin.readByte() -ge 0x80) {
-                        $keyframes.add($curBlock) >$null
-                    }
-                    $curBlock++
-                }
-            }
-            $IDs.Cluster {
-                $size = 0
-            }
-            $IDs.BlockGroup {
-                $blockGroup.current = @{ end = $datapos + $size; reference = $false }
-                $size = 0
+
+                $curBlock++
             }
         }
+        elseif ($id -eq $IDReferenceBlock) {
+            $blockGroupRef = $true
+        }
+        elseif ($id -eq $IDSimpleBlock) {
+            $bin.read($VINT, 0, 4) >$null
+            if ($VINT[0] -eq $vidtrackVINT) {
+                if ($getTC) {
+                    [Array]::reverse($VINT, 1, 2)
+                    $timecodes[$clusterTime + [BitConverter]::toInt16($VINT, 1)] = 0
+                }
+
+                if ($getKF -and $VINT[3] -ge 0x80) {
+                    $keyframes.add($curBlock) >$null
+                }
+
+                $curBlock++
+            }
+        }
+        elseif ($id -eq $IDCluster) {
+            $size = 0
+        }
+        elseif ($id -eq $IDTimecode -and $getTC) {
+            # read UINT
+            $VINT.clear()
+            $bin.read($VINT, 0, $size) >$null
+            [Array]::reverse($VINT, 0, $size)
+            $clusterTime = [BitConverter]::toUInt64($VINT, 0)
+        }
+        elseif ($id -eq $IDBlockGroup) {
+            $blockGroupEnd = $datapos + $size
+            $blockGroupRef = $false
+            $size = 0
+        }
+
         $stream.position = $datapos + $size
-        if ($stream.position -ge $blockGroup.video.end -and !$blockGroup.video.reference) {
+        if ($getKF -and $stream.position -ge $blockGroupVideoEnd -and !$blockGroupVideoRef) {
             $keyframes.add($curBlock - 1) >$null
-            $blockGroup.video.end = [uint64]::maxValue
+            $blockGroupVideoEnd = [uint64]::maxValue
         }
-        if ($curBlock%1000 -eq 1) {
+
+        if ($curBlock%1000 -eq 1 -and $opt.showProgress) {
             $progress = [Math]::max(0.000001, $stream.position / $stream.length)
             $elapsed = ([datetime]::now.ticks - $tick0)/10000000
             $remaining = $elapsed / $progress - $elapsed + 0.5
-            $lastKeyframe = if ($keyframes.count) { 'Last: ' + $keyframes[-1] } else { 'Searching' }
-            write-progress 'Keyframes..' -status $lastKeyframe -percent ($progress*100) -seconds $remaining
+            $status = if ($keyframes.count) { 'Last keyframe: ' + $keyframes[-1] } else { 'Last frame: ' + $curBlock }
+            write-progress 'Indexing..' -status $status -percent ($progress*100) -seconds $remaining
         }
     }
 
-    write-progress 'Keyframes..' -completed
-    $keyframes
+    if ($timecodes.count -eq 1) {
+        if ($len = $mkv.Segment.Tracks.Video._.find('DefaultDuration') -and $len[0]) {
+            $mkv.timecodeSpans = [ordered]@{
+                0 = @{
+                    fps = 1000000000 / $len[0]
+                    time = [timespan]::new(0)
+                }
+            }
+        }
+    }
+
+    if ($timecodes.count -gt 1) {
+        if ($opt.showProgress) {
+            write-progress 'Indexing..' -status 'Finding same FPS ranges' -percent 100
+        }
+        $mkv.timecodeSpans = [ordered]@{}
+        $spanStart = $spanStartms = $spanEnd = $spanEndms = $lastLen = 0
+        $tcScale = $mkv.Segment[0].Info[0]['TimecodeScale'] / 1000000 # milliseconds
+        if (!$tcScale) {
+            $tcScale = $DTD.Segment.Info.TimecodeScale._.value / 1000000
+        }
+        $threshold = 1 / $tcScale # 1ms
+        $lastIndex = $timecodes.count - 1
+        forEach ($tc in $timecodes.keys) {
+            $len = $tc - $spanEndms
+            $diff = $len - $lastLen
+            $fpschanged = ($diff -lt 0 -and $diff -lt -$threshold) -or ($diff -gt 0 -and $diff -gt $threshold)
+            if (($fpschanged -and $spanEnd -gt 1) -or $spanEnd -eq $lastIndex) {
+                $fps = $null
+                if ($spanLenms = $spanEndms - $spanStartms) {
+                    $fps = ($spanEnd - 1 - $spanStart) / $spanLenms * 1000 / $tcScale
+                    :snapFPS `
+                    forEach ($f in 18,24,25,30,48,60,120) {
+                        forEach ($div in 1, 1.001) {
+                            if ([math]::abs($fps - $f/$div) -le 0.001) {
+                                $fps = $f/$div
+                                break snapFPS
+                            }
+                        }
+                    }
+                    if ($fps - [math]::floor($fps) -le 0.001) {
+                        $fps = [math]::floor($fps)
+                    }
+                }
+                $mkv.timecodeSpans[[object]$spanStart] = @{
+                    time = [timespan]::new($spanStartms*10000)
+                    fps = $fps
+                }
+                $spanStart = $spanEnd - 1
+                $spanStartms = $spanEndms
+            }
+            $lastLen = $len
+            $spanEndms = $tc
+            $spanEnd++
+        }
+    }
+
+    if ($opt.showProgress) {
+        write-progress 'Indexing..' -completed
+    }
+
+    if ($getTC) { $mkv.timecodes = $timecodes }
+    if ($getKF) { $mkv.keyframes = $keyframes }
 }
 
 #endregion
@@ -1771,4 +1869,4 @@ function init {
 }
 #endregion
 
-export-moduleMember -function parseMKV, getMKVkeyframes
+export-moduleMember -function parseMKV
