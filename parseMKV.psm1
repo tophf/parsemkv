@@ -514,7 +514,7 @@ function readEntry($container) {
                     $bin.read($VINT, 0, $size) >$null
                     [Array]::reverse($VINT, 0, $size)
                     $value = [BitConverter]::toInt64($VINT, 0)
-                    if ($size -lt 8) {
+                    if ($size -lt 8 -and $VINT[$size-1] -ge 0x80) {
                         $value -= ([int64]1 -shl $size*8)
                     }
                 }
