@@ -1216,84 +1216,109 @@ function showProgressIfStuck {
 #region KEYFRAMES
 
 function getMKVkeyframes([string]$filepath) {
-    $keyframes = {}.invoke()
+    $keyframes = [Collections.ArrayList]::new()
     $tick0 = [datetime]::now.ticks
 
-    parseMKV $filepath -showProgress -keepStreamOpen -entryCallback {
-        param($entry)
+    $mkv = parseMKV $filepath -get Info,Tracks,Cluster -keepStreamOpen -entryCallback {
+        if ($args[0]._.name -eq 'Cluster') { 'abort' }
+    }
+    if (!$mkv -or !$mkv.Segment[0]['Cluster']) {
+        return
+    }
 
-        switch ($entry._.name) {
-            'Cluster' {}
-            'DocTypeVersion' {
-                if ($entry -lt 2) { return 'abort' }
-                return
-            }
-            default { return }
-        }
+    $bin = $mkv.reader
+    $stream = $bin.baseStream
 
-        $bin = $entry._.root._.parent.reader
-        $DTD = $entry._.root._.parent.DTD
-        $stream = $bin.baseStream
-        $stream.position = $entry._.datapos
+    $VINT = [byte[]]::new(8)
+    $vidtrackVINT = $mkv.Segment[0].Tracks.Video.TrackNumber -bor 0x80
 
-        $vidtrackVINT = $entry._.root.Tracks.Video.TrackNumber -bor 0x80
-        $VINT = [byte[]]::new(8)
+    $DTDseg = $mkv.DTD.Segment
+    $IDs = @{
+        Cluster = $DTDseg.Cluster._.id
+        SimpleBlock = $DTDseg.Cluster.SimpleBlock._.id
+        BlockGroup = $DTDseg.Cluster.BlockGroup._.id
+        Block = $DTDseg.Cluster.BlockGroup.Block._.id
+        ReferenceBlock = $DTDseg.Cluster.BlockGroup.ReferenceBlock._.id
+        CuePoint = $DTDseg.Cues.CuePoint._.id
+        CueTime = $DTDseg.Cues.CuePoint.CueTime._.id
+    }
 
-        $clusterID = $DTD.Segment.Cluster._.id
-        $simpleBlockID = $DTD.Segment.Cluster.SimpleBlock._.id
-        $blockGroupID = $DTD.Segment.Cluster.BlockGroup._.id
-        $blockID = $DTD.Segment.Cluster.BlockGroup.Block._.id
+    $curBlock = 0
+    $blockGroup = @{
+        video = @{ end = [uint64]::maxValue; reference = $false }
+    }
 
-        $curBlock = 0
-
-        while ($stream.position -lt $stream.length) {
-            # read ID
-            $VINT.clear()
-            $b = $VINT[0] = $bin.readByte()
-            if ($b -ge 0x80) {
-                $id = $b
+    $stream.position = $mkv.Segment.Cluster._.datapos
+    while ($stream.position -lt $stream.length) {
+        # read ID
+        $VINT.clear()
+        $b = $VINT[0] = $bin.readByte()
+        $id = if ($b -ge 0x80) {
+                $b
             } else {
                 $len = 8 - [byte][Math]::floor([Math]::log($b)/[Math]::log(2))
                 $bin.read($VINT, 1, $len - 1) >$null
                 [Array]::reverse($VINT, 0, $len)
-                $id = [BitConverter]::toUInt64($VINT, 0)
+                [BitConverter]::toUInt64($VINT, 0)
             }
-
-            # read size
-            $VINT.clear()
-            $b = $VINT[0] = $bin.readByte()
-            if ($b -ge 0x80) {
-                $size = $b -band 0x7F
+        # read size
+        $VINT.clear()
+        $b = $VINT[0] = $bin.readByte()
+        $size = if ($b -ge 0x80) {
+                $b -band 0x7F
             } else {
                 $len = 8 - [byte][Math]::floor([Math]::log($b)/[Math]::log(2))
                 $VINT[0] = $b -band -bnot (1 -shl (8-$len))
                 $bin.read($VINT, 1, $len - 1) >$null
                 [Array]::reverse($VINT, 0, $len)
-                $size = [BitConverter]::toUInt64($VINT, 0)
+                [BitConverter]::toUInt64($VINT, 0)
             }
-            $datapos = $stream.position
 
-            if ($id -eq $blockID) {
-                $curBlock++
-            } elseif ($id -eq $simpleBlockID -and $bin.readByte() -eq $vidtrackVINT) {
-                $stream.position += 2
-                if ($bin.readByte() -ge 0x80) {
-                    $keyframes.add($curBlock)
+        $datapos = $stream.position
 
-                    $progress = [Math]::max(0.000001, $stream.position / $stream.length)
-                    $elapsed = ([datetime]::now.ticks - $tick0)/10000000
-                    $remaining = $elapsed / $progress - $elapsed + 0.5
-                    write-progress 'Keyframes' -status "Frame $curBlock" -percent ($progress * 100) -seconds $remaining
+        switch ($id) {
+            $IDs.Block {
+                if ($bin.readByte() -eq $vidtrackVINT) {
+                    $curBlock++
+                    $blockGroup.video = $blockGroup.current
                 }
-                $curBlock++
             }
-
-            $stream.position = if ($clusterID, $blockGroupID -eq $id) { $datapos } else { $datapos + $size }
+            $IDs.ReferenceBlock {
+                $blockGroup.current.reference = $true
+            }
+            $IDs.SimpleBlock {
+                if ($bin.readByte() -eq $vidtrackVINT) {
+                    $stream.position += 2
+                    if ($bin.readByte() -ge 0x80) {
+                        $keyframes.add($curBlock) >$null
+                    }
+                    $curBlock++
+                }
+            }
+            $IDs.Cluster {
+                $size = 0
+            }
+            $IDs.BlockGroup {
+                $blockGroup.current = @{ end = $datapos + $size; reference = $false }
+                $size = 0
+            }
         }
-    } >$null
+        $stream.position = $datapos + $size
+        if ($stream.position -ge $blockGroup.video.end -and !$blockGroup.video.reference) {
+            $keyframes.add($curBlock - 1) >$null
+            $blockGroup.video.end = [uint64]::maxValue
+        }
+        if ($curBlock%1000 -eq 1) {
+            $progress = [Math]::max(0.000001, $stream.position / $stream.length)
+            $elapsed = ([datetime]::now.ticks - $tick0)/10000000
+            $remaining = $elapsed / $progress - $elapsed + 0.5
+            $lastKeyframe = if ($keyframes.count) { 'Last: ' + $keyframes[-1] } else { 'Searching' }
+            write-progress 'Keyframes..' -status $lastKeyframe -percent ($progress*100) -seconds $remaining
+        }
+    }
 
-    write-progress 'Keyframes' -completed
-    return $keyframes
+    write-progress 'Keyframes..' -completed
+    $keyframes
 }
 
 #endregion
