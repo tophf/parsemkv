@@ -1145,7 +1145,9 @@ function printEntry($entry) {
                 listTracksFor @($cue.CueTrack) 'TrackNumber'
                 $host.UI.writeLine()
             }
-            $host.UI.writeLine()
+            if ($entry.CueTrackPositions.count -gt 1) {
+                $host.UI.writeLine()
+            }
             return
         }
         '/Info/(DateUTC|(Muxing|Writing)App)$' {
