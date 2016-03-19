@@ -287,18 +287,13 @@ function readChildren($container) {
 
     while ($stream.position -lt $stopAt -and !$state.abort) {
 
-        $meta = readEntry $container
+        $meta = readEntry $container $stopAt
         if (!$meta) {
             break
         }
 
         $child = $meta.ref
 
-        if ($entryCallback) {
-            $cbStatus = & $entryCallback $child
-            if ($cbStatus -eq 'abort') { $state.abort = $true; break }
-            if ($cbStatus -eq 'skip')  { $meta.skipped = $true }
-        }
         if (!$meta['skipped']) {
             if ($meta.type -ne 'container') {
                 continue
@@ -395,7 +390,7 @@ function makeSingleParentsTransparent($container) {
     }
 }
 
-function readEntry($container) {
+function readEntry($container, $stopAt) {
 
     function bakeTime($value=$value, $meta=$meta, [bool]$ms, [bool]$fps, [switch]$noScaling) {
         [uint64]$nanoseconds = if ([bool]$noScaling) { $value }
@@ -419,244 +414,260 @@ function readEntry($container) {
     # inlining because PowerShell's overhead for a simple function call
     # is bigger than the time to execute it
 
-    $parentMeta = $container._
-    $meta = $dummyMeta.PSObject.copy()
-    $meta.pos = $stream.position
-
     $VINT = [byte[]]::new(8)
-    $VINT[0] = $first = $bin.readByte()
-    $id = $meta.id =
-        if ($first -eq 0 -or $first -eq 0xFF) {
-            -1
-        } elseif ($first -ge 0x80) {
-            $first
-        } elseif ($first -ge 0x40) {
-            [int]$first -shl 8 -bor $bin.readByte()
-        } else {
-            $len = 8 - [byte][Math]::floor([Math]::log($first)/[Math]::log(2))
-            $bin.read($VINT, 1, $len - 1) >$null
-            [Array]::reverse($VINT, 0, $len)
-            [BitConverter]::toUInt64($VINT, 0)
-        }
+    $globalIDs = $DTD._.globalIDs
+    $pathIDs = $DTD._.pathIDs
 
-    if (!($info = $DTD._.globalIDs[$id])) {
-        if (!($info = $DTD._.pathIDs[$parentMeta.path][$id])) {
-            $info = $DTD
-            forEach ($subpath in ($parentMeta.path.substring(1) -split '/')) {
-                if ($subpath -and (!$info._['recursiveNesting'] -or $subpath -ne $info._.name)) {
-                    $info = $info[$subpath]
-                }
-            }
-            $info = $info._.IDs[$id]
-        }
-    }
-    if ($info) {
-        $info = $info._
-        $name = $meta.name = $info.name
-        $type = $meta.type = $info.type
-    } else {
-        $info = @{}
-        $name = $meta.name = '?'
-        $type = $meta.type = 'binary'
-    }
+    $parentMeta = $container._
 
-    $path = $meta.path = $parentMeta.path + $name + '/'*[int]($type -eq 'container')
+    do {
+        $meta = $dummyMeta.PSObject.copy()
+        $meta.pos = $stream.position
 
-    $size = $meta.size =
-        if ($info -and $info.contains('size')) {
-            $info.size
-        } else {
-            $VINT.clear()
-            $VINT[0] = $first = $bin.readByte()
-            if ($first -eq 0xFF) {
-                $null # unknown size, usually streamed content or dynamically written
+        $VINT.clear()
+        $VINT[0] = $first = $bin.readByte()
+        $id = $meta.id =
+            if ($first -eq 0 -or $first -eq 0xFF) {
+                -1
             } elseif ($first -ge 0x80) {
-                $first -band 0x7F
+                $first
             } elseif ($first -ge 0x40) {
-                ([int]$first -band 0x3F) -shl 8 -bor $bin.readByte()
+                [int]$first -shl 8 -bor $bin.readByte()
             } else {
                 $len = 8 - [byte][Math]::floor([Math]::log($first)/[Math]::log(2))
-                $VINT[0] = $first -band -bnot (1 -shl (8-$len))
                 $bin.read($VINT, 1, $len - 1) >$null
                 [Array]::reverse($VINT, 0, $len)
                 [BitConverter]::toUInt64($VINT, 0)
             }
+
+        if (!($info = $globalIDs[$id])) {
+            if (!($info = $pathIDs[$parentMeta.path][$id])) {
+                $info = $DTD
+                forEach ($subpath in ($parentMeta.path.substring(1) -split '/')) {
+                    if ($subpath -and (!$info._['recursiveNesting'] -or $subpath -ne $info._.name)) {
+                        $info = $info[$subpath]
+                    }
+                }
+                $info = $info._.IDs[$id]
+            }
+        }
+        if ($info) {
+            $info = $info._
+            $name = $meta.name = $info.name
+            $type = $meta.type = $info.type
+        } else {
+            $info = @{}
+            $name = $meta.name = '?'
+            $type = $meta.type = 'binary'
         }
 
-    $datapos = $meta.datapos = $stream.position
+        $path = $meta.path = $parentMeta.path + $name + '/'*[int]($type -eq 'container')
 
-    if (!$info) {
-        $stream.position += $size
-        return $meta
-    }
-
-    $meta.level = $parentMeta['level'] + 1
-    $meta.root = $parentMeta['root']
-    $meta.parent = $container
-
-    if ((($type -eq 'container' -and $meta.level -eq 1) -or $name -eq 'Void') -and !$opt.get[$meta.name]) {
-        $stream.position += $size
-        $meta.ref = [ordered]@{ _=$meta }
-        $meta.skipped = $true
-        return $meta
-    }
-
-    if ($type -eq 'container') {
-        $meta.ref = $result = $dummyContainer.PSObject.copy()
-        $result._ = $meta
-    } else {
-        if ($size) {
-            if ($type -eq 'int') {
-                if ($size -eq 1) {
-                    $value = $bin.readSByte()
+        $size = $meta.size =
+            if ($info -and $info.contains('size')) {
+                $info.size
+            } else {
+                $VINT.clear()
+                $VINT[0] = $first = $bin.readByte()
+                if ($first -eq 0xFF) {
+                    $null # unknown size, usually streamed content or dynamically written
+                } elseif ($first -ge 0x80) {
+                    $first -band 0x7F
+                } elseif ($first -ge 0x40) {
+                    ([int]$first -band 0x3F) -shl 8 -bor $bin.readByte()
                 } else {
-                    $VINT.clear()
-                    $bin.read($VINT, 0, $size) >$null
-                    [Array]::reverse($VINT, 0, $size)
-                    $value = [BitConverter]::toInt64($VINT, 0)
-                    if ($size -lt 8 -and $VINT[$size-1] -ge 0x80) {
-                        $value -= ([int64]1 -shl $size*8)
-                    }
+                    $len = 8 - [byte][Math]::floor([Math]::log($first)/[Math]::log(2))
+                    $VINT[0] = $first -band -bnot (1 -shl (8-$len))
+                    $bin.read($VINT, 1, $len - 1) >$null
+                    [Array]::reverse($VINT, 0, $len)
+                    [BitConverter]::toUInt64($VINT, 0)
                 }
             }
-            elseif ($type -eq 'uint') {
-                if ($size -eq 1)     { $value = $bin.readByte() }
-                elseif ($size -eq 2) { $value = [int]$bin.readByte() -shl 8 -bor $bin.readByte() }
-                else {
-                    $VINT.clear()
-                    $bin.read($VINT, 0, $size) >$null
-                    [Array]::reverse($VINT, 0, $size)
-                    $value = [BitConverter]::toUInt64($VINT, 0)
-                }
-            }
-            elseif ($type -eq 'float') {
-                $buf = $bin.readBytes($size)
-                [Array]::reverse($buf)
-                $value = if ($size -eq 4)  { [BitConverter]::toSingle($buf, 0) }
-                     elseif ($size -eq 8)  { [BitConverter]::toDouble($buf, 0) }
-                     elseif ($size -eq 10) { decodeLongDouble $buf }
-                     else { write-warning "FLOAT should be 4, 8 or 10 bytes, got $size"
-                        0.0
-                     }
-            }
-            elseif ($type -eq 'date') {
-                $rawvalue = if ($size -ne 8) {
-                    write-warning "DATE should be 8 bytes, got $size"
-                    0
-                } else {
-                    $bin.read($VINT, 0, 8) >$null
-                    [Array]::reverse($VINT)
-                    [BitConverter]::toInt64($VINT,0)
-                }
-                $value = ([datetime]'2001-01-01T00:00:00.000Z').addTicks($rawvalue/100)
-            }
-            elseif ($type -eq 'string') {
-                $value = [Text.Encoding]::UTF8.getString($bin.readBytes($size))
-            }
-            elseif ($type -eq 'binary') {
-                $readSize = if ($opt.binarySizeLimit -lt 0 -or $name -eq 'SeekID') { $size }
-                            else { [Math]::min($opt.binarySizeLimit, $size) }
-                if ($readSize) {
-                    $value = $bin.readBytes($readSize)
 
-                    if ($name.endsWith('UID')) {
-                        $meta.displayString = bin2hex $value
-                    }
-                    elseif ($name -eq '?') {
-                        $s = [Text.Encoding]::UTF8.getString($value)
-                        if ($s -cmatch '^[\x20-\x7F]+$') {
-                            $meta.displayString =
-                                [BitConverter]::toString($value, 0,
-                                                            [Math]::min(16,$value.length)) +
-                                @('','...')[[int]($readSize -gt 16)] +
-                                " possible ASCII string: $s"
+        $datapos = $meta.datapos = $stream.position
+
+        if (!$info) {
+            $stream.position += $size
+            $state.abort = $entryCallback -and (& $entryCallback $meta.ref) -eq 'abort'
+            return $meta
+        }
+
+        $meta.level = $parentMeta['level'] + 1
+        $meta.root = $parentMeta['root']
+        $meta.parent = $container
+
+        if ((($type -eq 'container' -and $meta.level -eq 1) -or $name -eq 'Void') -and !$opt.get[$meta.name]) {
+            $stream.position += $size
+            $meta.ref = [ordered]@{ _=$meta }
+            $meta.skipped = $true
+            $state.abort = $entryCallback -and (& $entryCallback $meta.ref) -eq 'abort'
+            return $meta
+        }
+
+        if ($type -eq 'container') {
+            $meta.ref = $result = $dummyContainer.PSObject.copy()
+            $result._ = $meta
+        } else {
+            if ($size) {
+                if ($type -eq 'int') {
+                    if ($size -eq 1) {
+                        $value = $bin.readSByte()
+                    } else {
+                        $VINT.clear()
+                        $bin.read($VINT, 0, $size) >$null
+                        [Array]::reverse($VINT, 0, $size)
+                        $value = [BitConverter]::toInt64($VINT, 0)
+                        if ($size -lt 8 -and $VINT[$size-1] -ge 0x80) {
+                            $value -= ([int64]1 -shl $size*8)
                         }
                     }
-                } else {
-                    $value = [byte[]]::new(0)
+                }
+                elseif ($type -eq 'uint') {
+                    if ($size -eq 1)     { $value = $bin.readByte() }
+                    elseif ($size -eq 2) { $value = [int]$bin.readByte() -shl 8 -bor $bin.readByte() }
+                    else {
+                        $VINT.clear()
+                        $bin.read($VINT, 0, $size) >$null
+                        [Array]::reverse($VINT, 0, $size)
+                        $value = [BitConverter]::toUInt64($VINT, 0)
+                    }
+                }
+                elseif ($type -eq 'float') {
+                    $buf = $bin.readBytes($size)
+                    [Array]::reverse($buf)
+                    $value = if ($size -eq 4)  { [BitConverter]::toSingle($buf, 0) }
+                         elseif ($size -eq 8)  { [BitConverter]::toDouble($buf, 0) }
+                         elseif ($size -eq 10) { decodeLongDouble $buf }
+                         else { write-warning "FLOAT should be 4, 8 or 10 bytes, got $size"
+                            0.0
+                         }
+                }
+                elseif ($type -eq 'date') {
+                    $rawvalue = if ($size -ne 8) {
+                        write-warning "DATE should be 8 bytes, got $size"
+                        0
+                    } else {
+                        $bin.read($VINT, 0, 8) >$null
+                        [Array]::reverse($VINT)
+                        [BitConverter]::toInt64($VINT,0)
+                    }
+                    $value = ([datetime]'2001-01-01T00:00:00.000Z').addTicks($rawvalue/100)
+                }
+                elseif ($type -eq 'string') {
+                    $value = [Text.Encoding]::UTF8.getString($bin.readBytes($size))
+                }
+                elseif ($type -eq 'binary') {
+                    $readSize = if ($opt.binarySizeLimit -lt 0 -or $name -eq 'SeekID') { $size }
+                                else { [Math]::min($opt.binarySizeLimit, $size) }
+                    if ($readSize) {
+                        $value = $bin.readBytes($readSize)
+
+                        if ($name.endsWith('UID')) {
+                            $meta.displayString = bin2hex $value
+                        }
+                        elseif ($name -eq '?') {
+                            $s = [Text.Encoding]::UTF8.getString($value)
+                            if ($s -cmatch '^[\x20-\x7F]+$') {
+                                $meta.displayString =
+                                    [BitConverter]::toString($value, 0,
+                                                                [Math]::min(16,$value.length)) +
+                                    @('','...')[[int]($readSize -gt 16)] +
+                                    " possible ASCII string: $s"
+                            }
+                        }
+                    } else {
+                        $value = [byte[]]::new(0)
+                    }
                 }
             }
-        }
-        elseif ($info.contains('value')) {
-            $value = $info.value
-        }
-        elseif ($type -eq 'int')    { $value = 0 }
-        elseif ($type -eq 'uint')   { $value = 0 }
-        elseif ($type -eq 'float')  { $value = 0.0 }
-        elseif ($type -eq 'string') { $value = '' }
-        elseif ($type -eq 'binary') { $value = [byte[]]::new(0) }
-
-        $typecast =
-            if ($type -eq 'int')       { if ($size -le 4) { [int32] }  else { [int64] } }
-            elseif ($type -eq 'uint')  { if ($size -le 4) { [uint32] } else { [uint64] } }
-            elseif ($type -eq 'float') { if ($size -eq 4) { [single] } else { [double] } }
-
-        # using explicit assignment to keep empty values that get lost in $var=if....
-        if ($typecast) {
-            $result = $value -as $typecast
-        } else {
-            $result = $value
-        }
-
-        # cook the values
-        if ($path.endsWith('/Info/TimecodeScale')) {
-            $state.timecodeScale = $value
-            if ($dur = $container['Duration']) {
-                setEntryValue $dur (bakeTime $dur $dur._)
+            elseif ($info.contains('value')) {
+                $value = $info.value
             }
-        }
-        elseif ($path.endsWith('/Info/Duration') `
-            -or $path.endsWith('/Cluster/Timecode') `
-            -or $path.endsWith('/CuePoint/CueTime')) {
-            $result = bakeTime
-        }
-        elseif ($path.endsWith('/CueTrackPositions/CueDuration') `
-            -or $path.endsWith('/BlockGroup/BlockDuration')) {
-            $result = bakeTime -ms:$true
-        }
-        elseif ($path.endsWith('/ChapterAtom/ChapterTimeStart') `
-            -or $path.endsWith('/ChapterAtom/ChapterTimeEnd')) {
-            $result = [TimeSpan]::new($value / 100)
-            $meta.displayString = '{0:hh\:mm\:ss\.fff}' -f $result
-        }
-        elseif ($path.endsWith('/TrackEntry/DefaultDuration') `
-            -or $path.endsWith('/TrackEntry/DefaultDecodedFieldDuration')) {
-            $result = bakeTime -ms:$true -fps:$true -noScaling
-        }
-        elseif ($path.endsWith('/TrackEntry/TrackType')) {
-            if ($value = $DTD._.trackTypes[[int]$result]) {
-                $meta.rawValue = $result
+            elseif ($type -eq 'int')    { $value = 0 }
+            elseif ($type -eq 'uint')   { $value = 0 }
+            elseif ($type -eq 'float')  { $value = 0.0 }
+            elseif ($type -eq 'string') { $value = '' }
+            elseif ($type -eq 'binary') { $value = [byte[]]::new(0) }
+
+            $typecast =
+                if ($type -eq 'int')       { if ($size -le 4) { [int32] }  else { [int64] } }
+                elseif ($type -eq 'uint')  { if ($size -le 4) { [uint32] } else { [uint64] } }
+                elseif ($type -eq 'float') { if ($size -eq 4) { [single] } else { [double] } }
+
+            # using explicit assignment to keep empty values that get lost in $var=if....
+            if ($typecast) {
+                $result = $value -as $typecast
+            } else {
                 $result = $value
-                $tracks = $container._.parent
-                if ($existing = $tracks[$value]) {
-                    $existing.add($container) >$null
-                } else {
-                    $tracks[$value] = [Collections.ArrayList]@($container)
-                }
             }
-            'DefaultDuration', 'DefaultDecodedFieldDuration' | %{
-                if ($dur = $container[$_]) {
-                    setEntryValue $dur (bakeTime $dur $dur._ -ms:$true -fps:$true -noScaling)
-                }
-            }
-        }
-        # this single line consumes up to 50% of the entire processing time
-        $meta.ref = add-member _ $meta -inputObject $result -passthru
-    }
-    $stream.position = $datapos + $size
 
-    $existing = $container[$name]
-    if ($existing -eq $null) {
-        if ($info['multiple']) {
-            $container[$name] = [Collections.ArrayList] @(,$meta.ref)
-        } else {
-            $container[$name] = $meta.ref
+            # cook the values
+            if ($path.endsWith('/Info/TimecodeScale')) {
+                $state.timecodeScale = $value
+                if ($dur = $container['Duration']) {
+                    setEntryValue $dur (bakeTime $dur $dur._)
+                }
+            }
+            elseif ($path.endsWith('/Info/Duration') `
+                -or $path.endsWith('/Cluster/Timecode') `
+                -or $path.endsWith('/CuePoint/CueTime')) {
+                $result = bakeTime
+            }
+            elseif ($path.endsWith('/CueTrackPositions/CueDuration') `
+                -or $path.endsWith('/BlockGroup/BlockDuration')) {
+                $result = bakeTime -ms:$true
+            }
+            elseif ($path.endsWith('/ChapterAtom/ChapterTimeStart') `
+                -or $path.endsWith('/ChapterAtom/ChapterTimeEnd')) {
+                $result = [TimeSpan]::new($value / 100)
+                $meta.displayString = '{0:hh\:mm\:ss\.fff}' -f $result
+            }
+            elseif ($path.endsWith('/TrackEntry/DefaultDuration') `
+                -or $path.endsWith('/TrackEntry/DefaultDecodedFieldDuration')) {
+                $result = bakeTime -ms:$true -fps:$true -noScaling
+            }
+            elseif ($path.endsWith('/TrackEntry/TrackType')) {
+                if ($value = $DTD._.trackTypes[[int]$result]) {
+                    $meta.rawValue = $result
+                    $result = $value
+                    $tracks = $container._.parent
+                    if ($existing = $tracks[$value]) {
+                        $existing.add($container) >$null
+                    } else {
+                        $tracks[$value] = [Collections.ArrayList]@($container)
+                    }
+                }
+                'DefaultDuration', 'DefaultDecodedFieldDuration' | %{
+                    if ($dur = $container[$_]) {
+                        setEntryValue $dur (bakeTime $dur $dur._ -ms:$true -fps:$true -noScaling)
+                    }
+                }
+            }
+            # this single line consumes up to 50% of the entire processing time
+            $meta.ref = add-member _ $meta -inputObject $result -passthru
         }
-    } elseif ($existing -is [Collections.ArrayList]) {
-        $existing.add($meta.ref) >$null
-    } else { # should never happen according to DTD but just in case
-        $container[$name] = [Collections.ArrayList] @($existing, $meta.ref)
-    }
+        $stream.position = $datapos + $size
+
+        $existing = $container[$name]
+        if ($existing -eq $null) {
+            if ($info['multiple']) {
+                $container[$name] = [Collections.ArrayList] @(,$meta.ref)
+            } else {
+                $container[$name] = $meta.ref
+            }
+        } elseif ($existing -is [Collections.ArrayList]) {
+            $existing.add($meta.ref) >$null
+        } else { # should never happen according to DTD but just in case
+            $container[$name] = [Collections.ArrayList] @($existing, $meta.ref)
+        }
+
+        if ($entryCallback) {
+            $cbStatus = & $entryCallback $meta.ref
+            if ($cbStatus -eq 'abort') { $state.abort = $true; break }
+            if ($cbStatus -eq 'skip')  { $meta.skipped = $true; break }
+        }
+    } until (!$stopAt -or $stream.position -ge $stopAt -or $type -eq 'container')
+
     $meta
 }
 
