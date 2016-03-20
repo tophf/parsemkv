@@ -363,7 +363,7 @@ function readChildren($container) {
             $stream.position = $pos
             continue
         }
-        if ($meta.name -eq 'Cluster' -and !$opt.get['Cluster']) {
+        if ($meta.name -eq 'Cluster' -and $opt.get['Cluster'] -ne $true) {
             # here we don't need clusters and we don't have SeekHead
             # so in case more explicitly requested sections are needed
             # we'll try locating them at the end of the file
