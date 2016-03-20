@@ -1358,10 +1358,10 @@ function indexMKV {
     }
 
     if ($timecodes.count -eq 1) {
-        if ($len = $mkv.Segment.Tracks.Video._.find('DefaultDuration') -and $len[0]) {
+        if ($dur = $mkv.Segment.Tracks.Video._.find('DefaultDuration') -and $dur[0]) {
             $mkv.timecodeSpans = [ordered]@{
                 0 = @{
-                    fps = 1000000000 / $len[0]
+                    fps = 1000000000 / $dur[0]
                     time = [timespan]::new(0)
                 }
             }
@@ -1373,21 +1373,21 @@ function indexMKV {
             write-progress 'Indexing..' -status 'Finding same FPS ranges' -percent 100
         }
         $mkv.timecodeSpans = [ordered]@{}
-        $spanStart = $spanStartms = $spanEnd = $spanEndms = $lastLen = 0
-        $tcScale = $mkv.Segment[0].Info[0]['TimecodeScale'] / 1000000 # milliseconds
+        $spanStart = $spanStartTime = $spanEnd = $spanEndTime = $lastDur = 0
+        $tcScale = $mkv.Segment[0].Info[0]['TimecodeScale'] / 1000000 # scale mkv block time to ms
         if (!$tcScale) {
             $tcScale = $DTD.Segment.Info.TimecodeScale._.value / 1000000
         }
         $threshold = 1 / $tcScale # 1ms
         $lastIndex = $timecodes.count - 1
-        forEach ($tc in $timecodes) {
-            $len = $tc - $spanEndms
-            $diff = $len - $lastLen
+        forEach ($time in $timecodes) {
+            $dur = $time - $spanEndTime
+            $diff = $dur - $lastDur
             $fpschanged = ($diff -lt 0 -and $diff -lt -$threshold) -or ($diff -gt 0 -and $diff -gt $threshold)
             if (($fpschanged -and $spanEnd -gt 1) -or $spanEnd -eq $lastIndex) {
                 $fps = $null
-                if ($spanLenms = $spanEndms - $spanStartms) {
-                    $fps = ($spanEnd - 1 - $spanStart) / $spanLenms * 1000 / $tcScale
+                if ($spanDur = $spanEndTime - $spanStartTime) {
+                    $fps = ($spanEnd - 1 - $spanStart) / ($spanDur*$tcScale) * 1000
                     :snapFPS `
                     forEach ($f in 18,24,25,30,48,60,120) {
                         forEach ($div in 1, 1.001) {
@@ -1402,14 +1402,14 @@ function indexMKV {
                     }
                 }
                 $mkv.timecodeSpans[[object]$spanStart] = @{
-                    time = [timespan]::new($spanStartms*10000)
+                    time = [timespan]::new($spanStartTime * $tcScale * 10000)
                     fps = $fps
                 }
                 $spanStart = $spanEnd - 1
-                $spanStartms = $spanEndms
+                $spanStartTime = $spanEndTime
             }
-            $lastLen = $len
-            $spanEndms = $tc
+            $lastDur = $dur
+            $spanEndTime = $time
             $spanEnd++
         }
     }
