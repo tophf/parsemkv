@@ -1248,7 +1248,7 @@ function indexMKV {
 
     $getKF = $opt.get['keyframes']
     $getTC = $opt.get['timecodes']
-    $timecodes = [Collections.Generic.SortedList[uint64,int]]::new()
+    $timecodes = [Collections.Generic.SortedSet[uint64]]::new()
     $keyframes = [Collections.ArrayList]::new()
 
     $DTDcluster = $DTD.Segment.Cluster
@@ -1302,7 +1302,7 @@ function indexMKV {
 
                 if ($getTC) {
                     [Array]::reverse($VINT, 1, 2)
-                    $timecodes[$clusterTime + [BitConverter]::toInt16($VINT, 1)] = 0
+                    $timecodes.add($clusterTime + [BitConverter]::toInt16($VINT, 1)) >$null
                 }
 
                 $curBlock++
@@ -1316,7 +1316,7 @@ function indexMKV {
             if ($VINT[0] -eq $vidtrackVINT) {
                 if ($getTC) {
                     [Array]::reverse($VINT, 1, 2)
-                    $timecodes[$clusterTime + [BitConverter]::toInt16($VINT, 1)] = 0
+                    $timecodes.add($clusterTime + [BitConverter]::toInt16($VINT, 1)) >$null
                 }
 
                 if ($getKF -and $VINT[3] -ge 0x80) {
@@ -1380,7 +1380,7 @@ function indexMKV {
         }
         $threshold = 1 / $tcScale # 1ms
         $lastIndex = $timecodes.count - 1
-        forEach ($tc in $timecodes.keys) {
+        forEach ($tc in $timecodes) {
             $len = $tc - $spanEndms
             $diff = $len - $lastLen
             $fpschanged = ($diff -lt 0 -and $diff -lt -$threshold) -or ($diff -gt 0 -and $diff -gt $threshold)
