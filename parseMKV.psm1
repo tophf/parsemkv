@@ -1217,8 +1217,8 @@ function showProgressIfStuck {
         $print.progressmsgtick = $tick
     }
     write-progress $print.progress `
-        -percentComplete ($done * 100) `
-        -secondsRemaining ([Math]::min($print.progressremain, [int32]::maxValue))
+        -percent ([math]::min($done * 100, 100)) `
+        -seconds ([Math]::min($print.progressremain, [int32]::maxValue))
 }
 
 #endregion
