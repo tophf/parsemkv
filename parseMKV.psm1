@@ -15,9 +15,12 @@ set-strictMode -version 4
     Input file path
 
 .PARAMETER get
-    Level-1 sections to get (and 'EBML'), an array of strings.
+    Level-1 sections to get, an array of strings.
     Default: 'Info','Tracks','Chapters','Attachments' and additionally 'Tags' when printing.
     '*' means everything, *common' - the four above.
+    'keyframes' gets a list of keyframes in <result>.keyframes
+    'timecodes' gets a list of frame timecodes in <result>.timecodes and same-FPS spans in <result>.timecodeSpans
+    'useCFR' along with 'keyframes' assumes the video has constant frame rate and tries to use Cues (mkv seek index) to derive the keyframe list - USE ONLY WHEN 100% SURE THE VIDEO IS CFR
 
 .PARAMETER exhaustiveSearch
     In case a block wasn't found automatically it will be searched
@@ -28,11 +31,9 @@ set-strictMode -version 4
 
 .PARAMETER entryCallback
     Code block to be called on each entry.
-    Some time/date/tracktype values may yet be raw numbers because processing is
-    guaranteed to occur only after all child elements of a container are read.
+    Some time/date/tracktype values may yet be raw numbers because processing is guaranteed to occur only after all child elements of a container are read.
     Parameters: entry (with its metadata in _ property).
-    Return value: 'abort' to stop all processing, otherwise ignored.
-    //TODO: consider allowing to 'skip' current element.
+    Return value: 'abort' to stop all processing, 'skip' to skip current element, otherwise ignored.
 
 .PARAMETER keepStreamOpen
     Leave the BinaryReader stream open in <result>._.reader
@@ -98,29 +99,6 @@ set-strictMode -version 4
         '{0:h\:mm\:ss}' -f $chapter._.find('ChapterTimeStart') +
         " - " + $chapter._.find('ChapString')
     }
-
-.EXAMPLE
-    Getting a list of video keyframes via -entryCallback parameter (note: the exported getMKVkeyframes function below is much faster)
-
-    $keyframes = {}.invoke() # create an empty Collections`1 object
-    $currentBlock = 0
-
-    parseMKV 'c:\some\path\file.mkv' -get Info,Tracks,Cluster -showProgress -entryCallback {
-        param($entry)
-
-        if ($entry._.name -eq 'SimpleBlock' `
-        -and ($entry[0] -band 0x7F) -eq $entry._.root.Tracks.Video.TrackNumber) {
-
-            if ($entry[3] -ge 0x80) {
-                $keyframes.add($currentBlock)
-            }
-
-            $script:currentBlock++
-        }
-    }
-
-    $keyframes -join "`n" | out-file r:\kf.txt ASCII
-
 #>
 
 function parseMKV(
@@ -135,7 +113,7 @@ function parseMKV(
             '*common', <# is the next 4 #> 'Info','Tracks','Chapters','Attachments',
             'Tags','Tags:whenPrinting',
             'EBML', 'SeekHead','Cluster','Cues',
-            'keyframes', 'timecodes'
+            'keyframes', 'timecodes', 'useCFR'
         )]
     $get = @(
         '*common'
@@ -210,6 +188,7 @@ process {
     if ('keyframes' -in $get -or 'timecodes' -in $get) {
         $opt.get.Info = $opt.get.Tracks = $true
         $opt.get.KFTC = $opt.get.Cluster = 'find'
+        if ('useCFR' -in $get) { $opt.get.Cues = 'find' }
     }
     if ($opt.print -and 'Tags:whenPrinting' -in $get) {
         $opt.get.Tags = $true
@@ -296,8 +275,10 @@ function findNextRootContainer {
 function readChildren($container) {
 
     function gotLevel1 {
-        if ($DTD.Segment[$meta.name] -and !$DTD.Segment[$meta.name]._['multiple']) {
-            $opt.get.remove($meta.name)
+        $name = $meta.name
+        $info = $DTD.Segment[$name]
+        if ($info -and (!$info._['multiple'] -or $opt.get[$name] -eq 'find')) {
+            $opt.get.remove($name)
         }
     }
 
@@ -523,7 +504,7 @@ function readEntry($container, $stopAt) {
             return $meta
         }
 
-        if ($opt.get['KFTC'] -and $name -eq 'Cluster' -and $opt.get.Cluster -ne $true) {
+        if ($opt.get['KFTC'] -and 'Cluster','Cues' -eq $name -and $opt.get[$name] -ne $true) {
             $meta.skipped = $true
         }
 
@@ -1244,127 +1225,239 @@ function showProgressIfStuck {
 #region INDEXING
 
 function indexMKV {
+
+    function snapFPS([float]$fps) {
+        forEach ($f in 18,24,25,30,48,60,120) {
+            forEach ($div in 1, 1.001) {
+                if ([math]::abs($fps - $f/$div) -le 0.001) {
+                    return $f/$div
+                }
+            }
+        }
+        if ($fps - [math]::floor($fps) -le 0.001) {
+            return [math]::floor($fps)
+        }
+        $fps
+    }
+
+    if (!$mkv.Segment[0] -or !$mkv.Segment[0].Tracks -or !$mkv.Segment[0].Tracks.Video) {
+        write-warning 'Video tracks not found'
+        return
+    }
     $bin = $bin
     $stream = $stream
     $VINT = [byte[]]::new(8)
-    $vidtrackVINT = $mkv.Segment[0].Tracks.Video.TrackNumber -bor 0x80
+    $vidtrack = $mkv.Segment[0].Tracks.Video.TrackNumber
+    $vidtrackVINT = $vidtrack -bor 0x80
+    $tcScale = $mkv.Segment[0].Info[0]['TimecodeScale'] / 1000000 # scale mkv block time to ms
 
     $getKF = $opt.get['keyframes']
     $getTC = $opt.get['timecodes']
+    $useCFR = $opt.get['useCFR']
     $timecodes = [Collections.Generic.SortedSet[uint64]]::new()
     $keyframes = [Collections.ArrayList]::new()
 
-    $DTDcluster = $DTD.Segment.Cluster
-    $IDCluster = $DTDcluster._.id
-    $IDTimecode = $DTDcluster.Timecode._.id
-    $IDSimpleBlock = $DTDcluster.SimpleBlock._.id
-    $IDBlockGroup = $DTDcluster.BlockGroup._.id
-    $IDBlock = $DTDcluster.BlockGroup.Block._.id
-    $IDReferenceBlock = $DTDcluster.BlockGroup.ReferenceBlock._.id
-
-    $curBlock = 0
-    $blockGroupVideoEnd = [uint64]::maxValue
-    $blockGroupVideoRef = $false
-    $clusterTime = 0
-
-    $tick0 = [datetime]::now.ticks
-    $stream.position = $mkv.Segment[0].Cluster[0]._.datapos
-
-    while ($stream.position -lt $stream.length) {
-        # read ID
-        $VINT.clear()
-        $b = $VINT[0] = $bin.readByte()
-        $id = if ($b -ge 0x80) {
-                $b
-            } else {
-                $len = 8 - [byte][Math]::floor([Math]::log($b)/[Math]::log(2))
-                $bin.read($VINT, 1, $len - 1) >$null
-                [Array]::reverse($VINT, 0, $len)
-                [BitConverter]::toUInt64($VINT, 0)
-            }
-        # read size
-        $VINT.clear()
-        $b = $VINT[0] = $bin.readByte()
-        $size = if ($b -ge 0x80) {
-                $b -band 0x7F
-            } else {
-                $len = 8 - [byte][Math]::floor([Math]::log($b)/[Math]::log(2))
-                $VINT[0] = $b -band -bnot (1 -shl (8-$len))
-                $bin.read($VINT, 1, $len - 1) >$null
-                [Array]::reverse($VINT, 0, $len)
-                [BitConverter]::toUInt64($VINT, 0)
-            }
-
-        $datapos = $stream.position
-
-        if ($id -eq $IDBlock) {
-            $bin.read($VINT, 0, 4) >$null
-            if ($VINT[0] -eq $vidtrackVINT) {
-                $blockGroupVideoEnd = $blockGroupEnd
-                $blockGroupVideoRef = $blockGroupRef
-
-                if ($getTC) {
-                    [Array]::reverse($VINT, 1, 2)
-                    $timecodes.add($clusterTime + [BitConverter]::toInt16($VINT, 1)) >$null
-                }
-
-                $curBlock++
-            }
+    if ($useCFR) {
+        if (!$mkv.Segment[0]['Cues']) {
+            write-warning 'Cues not found'
+            return
         }
-        elseif ($id -eq $IDReferenceBlock) {
-            $blockGroupRef = $true
+        $frameDur = $mkv.Segment.Tracks.Video._.find('DefaultDuration')
+        if (!$frameDur) {
+            write-warning 'No default video frame duration found'
+            return
         }
-        elseif ($id -eq $IDSimpleBlock) {
-            $bin.read($VINT, 0, 4) >$null
-            if ($VINT[0] -eq $vidtrackVINT) {
-                if ($getTC) {
-                    [Array]::reverse($VINT, 1, 2)
-                    $timecodes.add($clusterTime + [BitConverter]::toInt16($VINT, 1)) >$null
-                }
+        $frameDur = $frameDur._.rawValue/1000000 # ms
+        $threshold = 1 / $frameDur # frame number rounding error for 1ms
+        $timecodes.add(0) >$null
 
-                if ($getKF -and $VINT[3] -ge 0x80) {
-                    $keyframes.add($curBlock) >$null
-                }
+        $DTDcuepoint = $DTD.Segment.Cues.CuePoint
+        $IDCuePoint = $DTDcuepoint._.id
+        $IDCueTime = $DTDcuepoint.CueTime._.id
+        $IDCueTrackPositions = $DTDcuepoint.CueTrackPositions._.id
+        $IDCueTrack = $DTDcuepoint.CueTrackPositions.CueTrack._.id
 
-                $curBlock++
-            }
-        }
-        elseif ($id -eq $IDCluster) {
-            $size = 0
-        }
-        elseif ($id -eq $IDTimecode -and $getTC) {
-            # read UINT
+        $time = $track = 0
+        $cueEnd = [uint64]::maxValue
+
+        $stream.position = $mkv.Segment.Cues._.datapos
+        while ($stream.position -lt $stream.length) {
+            # read ID
             $VINT.clear()
-            $bin.read($VINT, 0, $size) >$null
-            [Array]::reverse($VINT, 0, $size)
-            $clusterTime = [BitConverter]::toUInt64($VINT, 0)
-        }
-        elseif ($id -eq $IDBlockGroup) {
-            $blockGroupEnd = $datapos + $size
-            $blockGroupRef = $false
-            $size = 0
-        }
+            $b = $VINT[0] = $bin.readByte()
+            $id = if ($b -ge 0x80) {
+                    $b
+                } else {
+                    $len = 8 - [byte][Math]::floor([Math]::log($b)/[Math]::log(2))
+                    $bin.read($VINT, 1, $len - 1) >$null
+                    [Array]::reverse($VINT, 0, $len)
+                    [BitConverter]::toUInt64($VINT, 0)
+                }
+            # read size
+            $VINT.clear()
+            $b = $VINT[0] = $bin.readByte()
+            $size = if ($b -ge 0x80) {
+                    $b -band 0x7F
+                } else {
+                    $len = 8 - [byte][Math]::floor([Math]::log($b)/[Math]::log(2))
+                    $VINT[0] = $b -band -bnot (1 -shl (8-$len))
+                    $bin.read($VINT, 1, $len - 1) >$null
+                    [Array]::reverse($VINT, 0, $len)
+                    [BitConverter]::toUInt64($VINT, 0)
+                }
 
-        $stream.position = $datapos + $size
-        if ($getKF -and $stream.position -ge $blockGroupVideoEnd -and !$blockGroupVideoRef) {
-            $keyframes.add($curBlock - 1) >$null
-            $blockGroupVideoEnd = [uint64]::maxValue
-        }
+            if ($id -eq $IDCueTime) {
+                # read UINT
+                $VINT.clear()
+                $bin.read($VINT, 0, $size) >$null
+                [Array]::reverse($VINT, 0, $size)
+                $time = [BitConverter]::toUInt64($VINT, 0)
+            }
+            elseif ($id -eq $IDCueTrack) {
+                if ($size -eq 1) {
+                    $track = $bin.readByte()
+                } else {
+                    $VINT.clear()
+                    $bin.read($VINT, 0, $size) >$null
+                    [Array]::reverse($VINT, 0, $size)
+                    $track = [BitConverter]::toUInt64($VINT, 0)
+                }
+            }
+            elseif ($id -eq $IDCuePoint) {
+                $time = $track = $null
+                $cueEnd = $stream.position + $size
+            }
+            elseif ($id -ne $IDCueTrackPositions) {
+                $stream.position += $size
+            }
 
-        if ($curBlock%1000 -eq 1 -and $opt.showProgress) {
-            $progress = [Math]::max(0.000001, $stream.position / $stream.length)
-            $elapsed = ([datetime]::now.ticks - $tick0)/10000000
-            $remaining = $elapsed / $progress - $elapsed + 0.5
-            $status = if ($keyframes.count) { 'Last keyframe: ' + $keyframes[-1] } else { 'Last frame: ' + $curBlock }
-            write-progress 'Indexing..' -status $status -percent ($progress*100) -seconds $remaining
+            if ($stream.position -ge $cueEnd -and $track -eq $vidtrack) {
+                $ms = $time * $tcScale
+                $frame = $ms / $frameDur
+                if ($frame -lt 0 -or [math]::abs($frame - [uint64]$frame) -gt $threshold) {
+                    write-warning "Got irregular time $([timespan]::new($ms*10000)), CFR mode cannot be used"
+                    return
+                }
+                $keyframes.add([uint64]$frame) >$null
+            }
+        }
+    } else {
+        if (!$mkv.Segment[0].Cluster[0]) {
+            write-warning 'Clusters not found'
+            return
+        }
+        $DTDcluster = $DTD.Segment.Cluster
+        $IDCluster = $DTDcluster._.id
+        $IDTimecode = $DTDcluster.Timecode._.id
+        $IDSimpleBlock = $DTDcluster.SimpleBlock._.id
+        $IDBlockGroup = $DTDcluster.BlockGroup._.id
+        $IDBlock = $DTDcluster.BlockGroup.Block._.id
+        $IDReferenceBlock = $DTDcluster.BlockGroup.ReferenceBlock._.id
+
+        $curBlock = 0
+        $blockGroupVideoEnd = [uint64]::maxValue
+        $blockGroupVideoRef = $false
+        $clusterTime = 0
+
+        $tick0 = [datetime]::now.ticks
+        $stream.position = $mkv.Segment[0].Cluster[0]._.datapos
+
+        while ($stream.position -lt $stream.length) {
+            # read ID
+            $VINT.clear()
+            $b = $VINT[0] = $bin.readByte()
+            $id = if ($b -ge 0x80) {
+                    $b
+                } else {
+                    $len = 8 - [byte][Math]::floor([Math]::log($b)/[Math]::log(2))
+                    $bin.read($VINT, 1, $len - 1) >$null
+                    [Array]::reverse($VINT, 0, $len)
+                    [BitConverter]::toUInt64($VINT, 0)
+                }
+            # read size
+            $VINT.clear()
+            $b = $VINT[0] = $bin.readByte()
+            $size = if ($b -ge 0x80) {
+                    $b -band 0x7F
+                } else {
+                    $len = 8 - [byte][Math]::floor([Math]::log($b)/[Math]::log(2))
+                    $VINT[0] = $b -band -bnot (1 -shl (8-$len))
+                    $bin.read($VINT, 1, $len - 1) >$null
+                    [Array]::reverse($VINT, 0, $len)
+                    [BitConverter]::toUInt64($VINT, 0)
+                }
+
+            $datapos = $stream.position
+
+            if ($id -eq $IDBlock) {
+                $bin.read($VINT, 0, 4) >$null
+                if ($VINT[0] -eq $vidtrackVINT) {
+                    $blockGroupVideoEnd = $blockGroupEnd
+                    $blockGroupVideoRef = $blockGroupRef
+
+                    if ($getTC) {
+                        [Array]::reverse($VINT, 1, 2)
+                        $timecodes.add($clusterTime + [BitConverter]::toInt16($VINT, 1)) >$null
+                    }
+
+                    $curBlock++
+                }
+            }
+            elseif ($id -eq $IDReferenceBlock) {
+                $blockGroupRef = $true
+            }
+            elseif ($id -eq $IDSimpleBlock) {
+                $bin.read($VINT, 0, 4) >$null
+                if ($VINT[0] -eq $vidtrackVINT) {
+                    if ($getTC) {
+                        [Array]::reverse($VINT, 1, 2)
+                        $timecodes.add($clusterTime + [BitConverter]::toInt16($VINT, 1)) >$null
+                    }
+
+                    if ($getKF -and $VINT[3] -ge 0x80) {
+                        $keyframes.add($curBlock) >$null
+                    }
+
+                    $curBlock++
+                }
+            }
+            elseif ($id -eq $IDCluster) {
+                $size = 0
+            }
+            elseif ($id -eq $IDTimecode -and $getTC) {
+                # read UINT
+                $VINT.clear()
+                $bin.read($VINT, 0, $size) >$null
+                [Array]::reverse($VINT, 0, $size)
+                $clusterTime = [BitConverter]::toUInt64($VINT, 0)
+            }
+            elseif ($id -eq $IDBlockGroup) {
+                $blockGroupEnd = $datapos + $size
+                $blockGroupRef = $false
+                $size = 0
+            }
+
+            $stream.position = $datapos + $size
+            if ($getKF -and $stream.position -ge $blockGroupVideoEnd -and !$blockGroupVideoRef) {
+                $keyframes.add($curBlock - 1) >$null
+                $blockGroupVideoEnd = [uint64]::maxValue
+            }
+
+            if ($curBlock%1000 -eq 1 -and $opt.showProgress) {
+                $progress = [Math]::max(0.000001, $stream.position / $stream.length)
+                $elapsed = ([datetime]::now.ticks - $tick0)/10000000
+                $remaining = $elapsed / $progress - $elapsed + 0.5
+                $status = if ($keyframes.count) { 'Last keyframe: ' + $keyframes[-1] } else { 'Last frame: ' + $curBlock }
+                write-progress 'Indexing..' -status $status -percent ($progress*100) -seconds $remaining
+            }
         }
     }
 
     if ($timecodes.count -eq 1) {
-        if ($dur = $mkv.Segment.Tracks.Video._.find('DefaultDuration') -and $dur[0]) {
+        if ($dur = $mkv.Segment.Tracks.Video._.find('DefaultDuration')) {
             $mkv.timecodeSpans = [ordered]@{
                 0 = @{
-                    fps = 1000000000 / $dur[0]
+                    fps = snapFPS (1000 / $dur._.rawValue * 1000000)
                     time = [timespan]::new(0)
                 }
             }
@@ -1377,10 +1470,6 @@ function indexMKV {
         }
         $mkv.timecodeSpans = [ordered]@{}
         $spanStart = $spanStartTime = $spanEnd = $spanEndTime = $lastDur = 0
-        $tcScale = $mkv.Segment[0].Info[0]['TimecodeScale'] / 1000000 # scale mkv block time to ms
-        if (!$tcScale) {
-            $tcScale = $DTD.Segment.Info.TimecodeScale._.value / 1000000
-        }
         $threshold = 1 / $tcScale # 1ms
         $lastIndex = $timecodes.count - 1
         forEach ($time in $timecodes) {
@@ -1390,19 +1479,7 @@ function indexMKV {
             if (($fpschanged -and $spanEnd -gt 1) -or $spanEnd -eq $lastIndex) {
                 $fps = $null
                 if ($spanDur = $spanEndTime - $spanStartTime) {
-                    $fps = ($spanEnd - 1 - $spanStart) / ($spanDur*$tcScale) * 1000
-                    :snapFPS `
-                    forEach ($f in 18,24,25,30,48,60,120) {
-                        forEach ($div in 1, 1.001) {
-                            if ([math]::abs($fps - $f/$div) -le 0.001) {
-                                $fps = $f/$div
-                                break snapFPS
-                            }
-                        }
-                    }
-                    if ($fps - [math]::floor($fps) -le 0.001) {
-                        $fps = [math]::floor($fps)
-                    }
+                    $fps = snapFPS (($spanEnd - 1 - $spanStart) / ($spanDur*$tcScale) * 1000)
                 }
                 $mkv.timecodeSpans[[object]$spanStart] = @{
                     time = [timespan]::new($spanStartTime * $tcScale * 10000)
@@ -1421,7 +1498,7 @@ function indexMKV {
         write-progress 'Indexing..' -completed
     }
 
-    if ($getTC) { $mkv.timecodes = $timecodes }
+    if ($getTC -and !$useCFR) { $mkv.timecodes = $timecodes }
     if ($getKF) { $mkv.keyframes = $keyframes }
 }
 
