@@ -298,7 +298,7 @@ function readChildren($container) {
         $child = $meta.ref
 
         if (!$meta['skipped']) {
-            if ($meta.type -ne 'container') {
+            if ($meta.type -ne 'container' -or $meta.size -eq 0) {
                 continue
             }
             if (!$opt.print -or $state.print['postponed']) {
@@ -671,7 +671,7 @@ function readEntry($container, $stopAt) {
             if ($cbStatus -eq 'abort') { $state.abort = $true; break }
             if ($cbStatus -eq 'skip')  { $meta.skipped = $true; break }
         }
-    } until (!$stopAt -or $stream.position -ge $stopAt -or $type -eq 'container')
+    } until (!$stopAt -or $stream.position -ge $stopAt -or ($type -eq 'container' -and $size -ne 0))
 
     $meta
 }
