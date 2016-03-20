@@ -1218,7 +1218,8 @@ function showProgressIfStuck {
     } else {
         $section = $meta.closest('','/Segment/\w+/$')
     }
-    $done = ($meta.pos - $section._.datapos) / $section._.size
+    $size = $section._.size; if (!$size) { $size = $stream.length }
+    $done = ($meta.pos - $section._.datapos) / $size
     <# and update remaining time every 1sec #>
     if (!$state.print['progress'] -or $tick - $state.print['progressmsgtick'] -ge 10000000) {
         $silentSeconds = ($tick - $state.print.tick)/10000000
