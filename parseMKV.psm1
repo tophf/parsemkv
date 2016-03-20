@@ -1235,8 +1235,8 @@ function indexMKV {
                 }
             }
         }
-        if ($fps - [math]::floor($fps) -le 0.001) {
-            return [math]::floor($fps)
+        if ([math]::abs($fps - [int]$fps) -le 0.001) {
+            return [int]$fps
         }
         $fps
     }
