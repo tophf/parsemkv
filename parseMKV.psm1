@@ -301,6 +301,7 @@ function readChildren($container) {
         }
     }
 
+    $opt = $opt
     $stream = $stream
     $stream.position = $container._.datapos
     $stopAt = if ($container._.size) { $container._.datapos + $container._.size } else { $stream.length }
@@ -1208,11 +1209,12 @@ function printEntry($entry) {
 
 function showProgressIfStuck {
     $tick = [datetime]::now.ticks
+    $print = $state.print
     <# after 0.5sec of silence #>
-    if ($tick - $state.print.tick -lt 5000000) {
+    if ($tick - $print.tick -lt 5000000) {
         return
     }
-    $state.print.progresstick = $tick
+    $print.progresstick = $tick
     if ($meta.path -match '/Cluster/') {
         $section = $segment
     } else {
@@ -1221,21 +1223,21 @@ function showProgressIfStuck {
     $size = $section._.size; if (!$size) { $size = $stream.length }
     $done = ($meta.pos - $section._.datapos) / $size
     <# and update remaining time every 1sec #>
-    if (!$state.print['progress'] -or $tick - $state.print['progressmsgtick'] -ge 10000000) {
-        $silentSeconds = ($tick - $state.print.tick)/10000000
+    if (!$print['progress'] -or $tick - $print['progressmsgtick'] -ge 10000000) {
+        $silentSeconds = ($tick - $print.tick)/10000000
         $remain = $silentSeconds / $done - $silentSeconds + 0.5
         <# smooth-average the remaining time #>
-        $state.print.progressremain =
-            if (!$state.print['progress']) { $remain }
-            else { ($state.print.progressremain + $remain) / 2 }
+        $print.progressremain =
+            if (!$print['progress']) { $remain }
+            else { ($print.progressremain + $remain) / 2 }
         $action = @('Reading', 'Skipping')[!!$meta['skipped']]
         <# show level-1 section name to avoid flicker of alternate subcontainers #>
-        $state.print.progress = "$action $($meta.path -replace '^/\w+/(\w+).*','$1') elements..."
-        $state.print.progressmsgtick = $tick
+        $print.progress = "$action $($meta.path -replace '^/\w+/(\w+).*','$1') elements..."
+        $print.progressmsgtick = $tick
     }
-    write-progress $state.print.progress `
+    write-progress $print.progress `
         -percentComplete ($done * 100) `
-        -secondsRemaining ([Math]::min($state.print.progressremain, [int32]::maxValue))
+        -secondsRemaining ([Math]::min($print.progressremain, [int32]::maxValue))
 }
 
 #endregion
