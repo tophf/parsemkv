@@ -460,6 +460,7 @@ function readEntry($container, $stopAt) {
             $info = @{}
             $name = $meta.name = '?'
             $type = $meta.type = 'binary'
+            $meta.displayString = 'ID {0:x2}' -f $id
         }
 
         $path = $meta.path = $parentMeta.path + $name + '/'*[int]($type -eq 'container')
@@ -572,7 +573,7 @@ function readEntry($container, $stopAt) {
                         elseif ($name -eq '?') {
                             $s = [Text.Encoding]::UTF8.getString($value)
                             if ($s -cmatch '^[\x20-\x7F]+$') {
-                                $meta.displayString =
+                                $meta.displayString += ' data: ' +
                                     [BitConverter]::toString($value, 0,
                                                                 [Math]::min(16,$value.length)) +
                                     @('','...')[[int]($readSize -gt 16)] +
