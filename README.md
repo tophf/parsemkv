@@ -11,30 +11,35 @@ Usage examples:
 
   Some entries are skipped by default, see parameter descriptions in the code.
 
+  Unabridged output: `parseMKV '....' -printRaw`
+
+* **Get the duration value**
+  ```powershell
+  $mkv = parseMKV 'c:\some\path\file.mkv' -get Info -binarySizeLimit 0
+  $duration = $mkv.Segment.Info.Duration
+  ```
+  Parsing is stopped after 'Info' section is read and binary entries are skipped for speedup
+
 * **Print video/audio info**
   ```powershell
   $mkv = parseMKV 'c:\some\path\file.mkv'`
-  $mkv.Tracks.Video | %{
+  $mkv.Segment.Tracks.Video | %{
   	'Video: {0}x{1}, {2}' -f $_.Video.PixelWidth, $_.Video.PixelHeight, $_.CodecID
   }
-  $isMultiAudio = $mkv.Tracks.Audio.Capacity -gt 1
-  $mkv.Tracks.Audio | %{ $index=0 } {
+  $isMultiAudio = $mkv.Segment.Tracks.Audio.Capacity -gt 1
+  $mkv.Segment.Tracks.Audio | %{ $index=0 } {
   	'Audio{0}: {1}{2}' -f (++$index), $_.CodecID, $_.Audio.SamplingFrequency
   }
   ```
 
-* **Get the duration value**
-  ```powershell
-  $mkv = parseMKV 'c:\some\path\file.mkv' -stopOn 'tracks' -binarySizeLimit 0
-  $duration = $mkv.Info.Duration
-  ```
-  Parsing is stopped on 'tracks' entry and binary entries are skipped to speedup parsing
-
-* **Extract the attachments**
+* **Extract all attachments**
   ```powershell
   $mkv = parseMKV 'c:\some\path\file.mkv' -keepStreamOpen -binarySizeLimit 0
+  $outputDir = 'd:\'
+  echo "Extracting to $outputDir"
   forEach ($att in $mkv.find('AttachedFile')) {
-  	$file = [IO.File]::create($att.FileName)
+  	write-host "`t$($att.FileName)"
+  	$file = [IO.File]::create((join-path $outputDir $att.FileName))
   	$mkv.reader.baseStream.position = $att.FileData._.datapos
   	$data = $mkv.reader.readBytes($att.FileData._.size)
   	$file.write($data, 0, $data.length)
@@ -43,23 +48,7 @@ Usage examples:
   $mkv.reader.close()
   ```
 
-* **Print with filtering**
-  ```powershell
-  parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0]._.type -eq 'string' }
-  ```
-
-  ```powershell
-  parseMKV 'c:\some\path\file.mkv' -print -printFilter { $args[0] -is [datetime] }
-  ```
-
-  ```powershell
-  parseMKV 'c:\some\path\file.mkv' -print -printFilter { param($e)
-  	$e._.name -match '^Chap(String|Lang|terTime)' -and `
-  	$e._.closest('ChapterAtom').ChapterTimeStart.hours -ge 1
-  }
-  ```
-
-* **Finding sub-elements**
+* **Find/access elements**
   ```powershell
   $mkv = parseMKV 'c:\some\path\file.mkv'
   ```
@@ -71,7 +60,7 @@ Usage examples:
   ```
 
   ```powershell
-  $DisplayWxH = $mkv.Tracks.Video._.find('', '^Display[WH]') -join 'x'
+  $DisplayWxH = $mkv.Segment.Tracks.Video._.find('', '^Display[WH]') -join 'x'
   ```
 
   ```powershell

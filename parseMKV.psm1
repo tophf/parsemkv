@@ -65,16 +65,14 @@ set-strictMode -version 4
     $audioTracksCount = $mkv.Segment.Tracks.Audio.count
 
 .EXAMPLE
-    $mkv = parseMKV 'c:\some\path\file.mkv' -stopOn '/tracks/' -binarySizeLimit 0
+    Extract all attachments
 
-    $duration = $mkv.Segment.Info.Duration
-    $duration = $mkv.Segment[1].Info[0].Duration # multi-segmented mkv!
-
-.EXAMPLE
     $mkv = parseMKV 'c:\some\path\file.mkv' -keepStreamOpen -binarySizeLimit 0
-
+    $outputDir = 'd:\'
+    echo "Extracting to $outputDir"
     forEach ($att in $mkv.find('AttachedFile')) {
-        $file = [IO.File]::create($att.FileName)
+        write-host "`t$($att.FileName)"
+        $file = [IO.File]::create((join-path $outputDir $att.FileName))
         $mkv.reader.baseStream.position = $att.FileData._.datapos
         $data = $mkv.reader.readBytes($att.FileData._.size)
         $file.write($data, 0, $data.length)
@@ -83,6 +81,8 @@ set-strictMode -version 4
     $mkv.reader.close()
 
 .EXAMPLE
+    Find/access elements
+
     $mkv = parseMKV 'c:\some\path\file.mkv'
 
     $DisplayWidth = $mkv.find('DisplayWidth')
