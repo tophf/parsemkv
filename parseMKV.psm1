@@ -1240,6 +1240,19 @@ function indexMKV {
         }
         $fps
     }
+    function addFPSspan {
+        if ($spanDur = $spanEndTime - $spanStartTime) {
+            $fps = snapFPS (($spanEnd - 1 - $spanStart) / ($spanDur*$tcScale) * 1000)
+        } else {
+            $fps = [float]::PositiveInfinity
+        }
+        $mkv.timecodeSpans[[object]$spanStart] = @{
+            time = [timespan]::new($spanStartTime * $tcScale * 10000)
+            fps = $fps
+        }
+        sv spanStart ($spanEnd - 1) -scope 1
+        sv spanStartTime $spanEndTime -scope 1
+    }
 
     if (!$mkv.Segment[0] -or !$mkv.Segment[0].Tracks -or !$mkv.Segment[0].Tracks.Video) {
         write-warning 'Video tracks not found'
@@ -1472,26 +1485,20 @@ function indexMKV {
         $mkv.timecodeSpans = [ordered]@{}
         $spanStart = $spanStartTime = $spanEnd = $spanEndTime = $lastDur = 0
         $threshold = 1 / $tcScale # 1ms
-        $lastIndex = $timecodes.count - 1
         forEach ($time in $timecodes) {
             $dur = $time - $spanEndTime
             $diff = $dur - $lastDur
             $fpschanged = ($diff -lt 0 -and $diff -lt -$threshold) -or ($diff -gt 0 -and $diff -gt $threshold)
-            if (($fpschanged -and $spanEnd -gt 1) -or $spanEnd -eq $lastIndex) {
-                $fps = $null
-                if ($spanDur = $spanEndTime - $spanStartTime) {
-                    $fps = snapFPS (($spanEnd - 1 - $spanStart) / ($spanDur*$tcScale) * 1000)
-                }
-                $mkv.timecodeSpans[[object]$spanStart] = @{
-                    time = [timespan]::new($spanStartTime * $tcScale * 10000)
-                    fps = $fps
-                }
-                $spanStart = $spanEnd - 1
-                $spanStartTime = $spanEndTime
+            if ($fpschanged -and $spanEnd -gt 1) {
+                addFPSspan
             }
             $lastDur = $dur
             $spanEndTime = $time
             $spanEnd++
+        }
+        # handle fps change right before the last frame
+        if (($fpschanged -and $spanStart -eq $timecodes.count-2) -or $spanStart -eq 0) {
+            addFPSspan
         }
     }
 
