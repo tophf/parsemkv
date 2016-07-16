@@ -214,7 +214,6 @@ process {
         }
 
         $container = $meta.root = $meta.ref
-        $meta.level = 0
         $meta.root = $segment = $container
         $allSeekHeadsFound = $false
 
@@ -222,7 +221,7 @@ process {
             $state.abort = $true
             break
         }
-        if ($opt.print) {
+        if ($opt.print -and !$opt.printRaw) {
             printEntry $container
         }
 
@@ -304,7 +303,9 @@ function readChildren($container) {
             if (!$opt.print -or $state.print['postponed']) {
                 readChildren $child
             } elseif ($meta.path -cnotmatch $printPostponed -or $opt.printRaw) {
-                printEntry $child
+                if (!$opt.printRaw) {
+                    printEntry $child
+                }
                 readChildren $child
             } elseif ($matches) {
                 $state.print.postponed = $true
@@ -369,7 +370,7 @@ function readChildren($container) {
 
     makeSingleParentsTransparent $container
 
-    if ($opt.print -and !$state.abort -and !$state.print['postponed']) {
+    if ($opt.print -and !$opt.printRaw -and !$state.abort -and !$state.print['postponed']) {
         printChildren $container
     } elseif ($opt.showProgress -and ([datetime]::now.ticks - $state.print['progresstick'] -ge 1000000)) {
         showProgressIfStuck
@@ -415,6 +416,7 @@ function readEntry($container, $stopAt) {
 
     $bin = $bin
     $stream = $stream
+    $opt = $opt
     $VINT = [byte[]]::new(8)
     $globalIDs = $DTD._.globalIDs
     $pathIDs = $DTD._.pathIDs
@@ -493,7 +495,7 @@ function readEntry($container, $stopAt) {
             return $meta
         }
 
-        $meta.level = $parentMeta['level'] + 1
+        $meta.level = if ($parentMeta.contains('level')) { $parentMeta.level + 1 } else { 0 }
         $meta.root = $parentMeta['root']
         $meta.parent = $container
 
@@ -670,6 +672,10 @@ function readEntry($container, $stopAt) {
             $cbStatus = & $entryCallback $meta.ref
             if ($cbStatus -eq 'abort') { $state.abort = $true; break }
             if ($cbStatus -eq 'skip')  { $meta.skipped = $true; break }
+        }
+
+        if ($opt.printRaw -and !$meta['skipped'] -and !$meta['abort']) {
+            printEntry $meta.ref
         }
     } until (!$stopAt -or $stream.position -ge $stopAt -or ($type -eq 'container' -and $size -ne 0))
 
