@@ -44,6 +44,9 @@ set-strictMode -version 4
 .PARAMETER printRaw
     Print the element tree as is.
 
+.PARAMETER printDebug
+    printRaw + show file offset, size, element ID
+
 .PARAMETER showProgress
     Show the progress for long operations even when not printing.
 
@@ -136,6 +139,9 @@ function parseMKV(
     $printRaw,
 
         [switch]
+    $printDebug,
+
+        [switch]
     $showProgress,
 
         [scriptblock]
@@ -174,7 +180,8 @@ process {
         exhaustiveSearch = [bool]$exhaustiveSearch
         binarySizeLimit = $binarySizeLimit
         print = [bool]$print -or [bool]$printRaw
-        printRaw = [bool]$printRaw
+        printRaw = [bool]$printRaw -or [bool]$printDebug
+        printDebug = [bool]$printDebug
         showProgress = [bool]$showProgress -or [bool]$print -or [bool]$printRaw
     }
     if ('*' -in $get) {
@@ -1008,6 +1015,15 @@ function printEntry($entry) {
     $last.emptyBinary = $emptyBinary
 
     $indent = '  '*$meta.level
+    if ($opt.printDebug) {
+        $color = if ($meta.type -eq 'container') {
+            if ($meta.level -le 1) { $colors.bold } else { $colors.normal }
+        } else {
+            $colors.dim
+        }
+        $host.UI.write($color, 0,
+            ("{0,10:d} {1,9:d} {2,8}`t" -f $meta.pos, $meta.size, ('{0:x8}' -f $meta.id -replace '^(00)+','')))
+    }
 
     if (!$opt.printRaw) {
       $last['needLineFeed'] = $false
@@ -1183,8 +1199,9 @@ function printEntry($entry) {
         $meta.displayString
     } elseif ($meta.type -eq 'binary') {
         if ($entry.length) {
-            $ellipsis = if ($entry.length -lt $meta.size) { '...' } else { '' }
-            "[$($meta.size) bytes] $((bin2hex $entry) -replace '(.{8})', '$1 ')$ellipsis"
+            $s = ((bin2hex $entry) -replace '(.{8})', '$1 ')
+            if (!$opt.printDebug) { $s = "[$($meta.size) bytes] $s" }
+            if ($entry.length -lt $meta.size) { "$s..." } else { $s }
         }
     } elseif ($meta.type -ne 'container') {
         "$entry"
