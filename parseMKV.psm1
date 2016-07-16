@@ -1369,6 +1369,7 @@ function indexMKV {
         $IDReferenceBlock = $DTDcluster.BlockGroup.ReferenceBlock._.id
 
         $curBlock = 0
+        $blockIsVideo = $false
         $blockGroupVideoEnd = [uint64]::maxValue
         $blockGroupVideoRef = $false
         $clusterTime = 0
@@ -1405,7 +1406,7 @@ function indexMKV {
 
             if ($id -eq $IDBlock) {
                 $bin.read($VINT, 0, 4) >$null
-                if ($VINT[0] -eq $vidtrackVINT) {
+                if ($blockIsVideo = $VINT[0] -eq $vidtrackVINT) {
                     $blockGroupVideoEnd = $blockGroupEnd
                     $blockGroupVideoRef = $blockGroupRef
 
@@ -1419,6 +1420,10 @@ function indexMKV {
             }
             elseif ($id -eq $IDReferenceBlock) {
                 $blockGroupRef = $true
+                if ($blockIsVideo) {
+                    $blockGroupVideoEnd = $blockGroupEnd
+                    $blockGroupVideoRef = $blockGroupRef
+                }
             }
             elseif ($id -eq $IDSimpleBlock) {
                 $bin.read($VINT, 0, 4) >$null
@@ -1448,6 +1453,7 @@ function indexMKV {
             elseif ($id -eq $IDBlockGroup) {
                 $blockGroupEnd = $datapos + $size
                 $blockGroupRef = $false
+                $blockIsVideo = $false
                 $size = 0
             }
 
