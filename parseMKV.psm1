@@ -105,49 +105,39 @@ set-strictMode -version 4
 #>
 
 function parseMKV(
-        [string] [parameter(valueFromPipeline)]
-                 [validateScript({ if ((test-path -literal $_) -or (test-path $_)) { $true }
-                                   else { write-warning 'File not found'; throw } })]
+    [string]
+    [parameter(valueFromPipeline)]
+    [validateScript({ if ((test-path -literal $_) -or (test-path $_)) { $true }
+                      else { write-warning 'File not found'; throw } })]
     $filepath,
 
-        [string[]]
-        [validateSet(
-            '*', <# tries to get everything except keyframes/timecodes #>
-            '*common', <# is the next 4 #> 'Info','Tracks','Chapters','Attachments',
-            'Tags','Tags:whenPrinting',
-            'EBML', 'SeekHead','Cluster','Cues',
-            'keyframes', 'timecodes', 'useCFR'
-        )]
-    $get = @(
-        '*common'
-        'Tags:whenPrinting'
-    ),
+    [string[]]
+    [validateSet(
+        '*', <# tries to get everything except keyframes/timecodes #>
+        '*common', <# is the next 4 #> 'Info','Tracks','Chapters','Attachments',
+        'Tags','Tags:whenPrinting',
+        'EBML', 'SeekHead','Cluster','Cues',
+        'keyframes', 'timecodes', 'useCFR'
+    )]
+    $get = @('*common', 'Tags:whenPrinting'),
 
-        [switch]
-    $exhaustiveSearch,
-
-        [int32] [validateRange(-1, [int32]::MaxValue)]
+    [int32]
+    [validateRange(-1, [int32]::MaxValue)]
     $binarySizeLimit = 16,
 
-        [switch]
-    $keepStreamOpen,
+    [scriptblock] $entryCallback,
 
-        [switch]
-    $print,
+    [switch] $exhaustiveSearch,
+    [switch] $keepStreamOpen,
 
-        [switch]
-    $printRaw,
-
-        [switch]
-    $printDebug,
-
-        [switch]
-    $showProgress,
-
-        [scriptblock]
-    $entryCallback
+    [switch] $print,
+    [switch] $printRaw,
+    [switch] $printDebug,
+    [switch] $showProgress
 ) {
+
 process {
+
     if (!(test-path -literal $filepath)) {
         $filepath = "$(gi $filepath)"
     }
@@ -160,7 +150,7 @@ process {
             16, # by default read-ahead is 4096 and we don't need that after every seek
             [IO.FileOptions]::RandomAccess
         )
-        $bin = [IO.BinaryReader] $stream
+        $bin = [IO.BinaryReader]$stream
     } catch {
         throw $_
         return $null
@@ -169,44 +159,25 @@ process {
     if (!(test-path variable:script:DTD)) {
         init
     }
+
     $state = @{
         abort = $false # set when entryCallback returns 'abort'
         print = @{ tick=[datetime]::now.ticks }
         timecodeScale = $DTD.Segment.Info.TimecodeScale._.value
     }
-    # less ambiguous local alias
-    $opt = @{
-        get = @{ EBML='auto'; Segment='auto'; SeekHead='auto' }
-        exhaustiveSearch = [bool]$exhaustiveSearch
-        binarySizeLimit = $binarySizeLimit
-        print = [bool]$print -or [bool]$printRaw
-        printRaw = [bool]$printRaw -or [bool]$printDebug
-        printDebug = [bool]$printDebug
-        showProgress = [bool]$showProgress -or [bool]$print -or [bool]$printRaw
-    }
-    if ('*' -in $get) {
-        $DTD, $DTD.Segment | %{
-            $_.getEnumerator() | ?{ $_.name -ne '_' } | %{ $opt.get[$_.name] = 'auto' }
-        }
-    }
-    if ('*common' -in $get) {
-        'Info', 'Tracks', 'Chapters', 'Attachments' | %{ $opt.get[$_] = 'auto' }
-    }
-    if ('keyframes' -in $get -or 'timecodes' -in $get) {
-        $opt.get.Info = $opt.get.Tracks = $true
-        $opt.get.KFTC = $opt.get.Cluster = 'find'
-        if ('useCFR' -in $get) { $opt.get.Cues = 'find' }
-    }
-    if ($opt.print -and 'Tags:whenPrinting' -in $get) {
-        $opt.get.Tags = $true
-    }
-    $get | ?{ $_ -match '^\w+$' } | %{ $opt.get[$_] = $true }
+
+    $opt = parseOptions
 
     $mkv = $dummyMeta.PSObject.copy()
     $mkv.PSObject.members.remove('closest')
-    $mkv | add-member ([ordered]@{ path='/'; ref=$mkv; _=$mkv; DTD=$DTD})
-    $mkv.EBML = [Collections.ArrayList]@()
-    $mkv.Segment = [Collections.ArrayList]@()
+    $mkv | add-member ([ordered]@{
+        path = '/'
+        DTD = $DTD
+        ref = $mkv
+        _ = $mkv
+    })
+    $mkv.EBML = [Collections.ArrayList]::new()
+    $mkv.Segment = [Collections.ArrayList]::new()
 
     if ([bool]$keepStreamOpen) {
         $mkv | add-member reader $bin
@@ -216,7 +187,7 @@ process {
 
         $meta = if (findNextRootContainer) { readEntry $mkv }
 
-        if (!$meta -or !$meta['ref'] -or $meta['path'] -cnotmatch '^/(EBML|Segment)/$') {
+        if (!$meta -or !$meta['ref'] -or $meta['path'] -notmatch '^/(EBML|Segment)/$') {
             throw 'Cannot find EBML or Segment structure'
         }
 
@@ -256,9 +227,40 @@ process {
     makeSingleParentsTransparent $mkv
     $mkv
 }
+
 }
 
 #region MAIN
+
+function parseOptions {
+    $opt = @{
+        get = @{ EBML='auto'; Segment='auto'; SeekHead='auto' }
+        exhaustiveSearch = [bool]$exhaustiveSearch
+        binarySizeLimit = $binarySizeLimit
+        print = [bool]$print -or [bool]$printRaw
+        printRaw = [bool]$printRaw -or [bool]$printDebug
+        printDebug = [bool]$printDebug
+        showProgress = [bool]$showProgress -or [bool]$print -or [bool]$printRaw
+    }
+    if ('*' -in $get) {
+        $DTD, $DTD.Segment | %{
+            $_.getEnumerator() | ?{ $_.name -ne '_' } | %{ $opt.get[$_.name] = 'auto' }
+        }
+    }
+    if ('*common' -in $get) {
+        'Info', 'Tracks', 'Chapters', 'Attachments' | %{ $opt.get[$_] = 'auto' }
+    }
+    if ('keyframes' -in $get -or 'timecodes' -in $get) {
+        $opt.get.Info = $opt.get.Tracks = $true
+        $opt.get.KFTC = $opt.get.Cluster = 'find'
+        if ('useCFR' -in $get) { $opt.get.Cues = 'find' }
+    }
+    if ($opt.print -and 'Tags:whenPrinting' -in $get) {
+        $opt.get.Tags = $true
+    }
+    $get | ?{ $_ -match '^\w+$' } | %{ $opt.get[$_] = $true }
+    $opt
+}
 
 function findNextRootContainer {
     $toRead = 4 # EBML/Segment ID size
@@ -665,14 +667,14 @@ function readEntry($container, $stopAt) {
         $existing = $container[$name]
         if ($existing -eq $null) {
             if ($info['multiple']) {
-                $container[$name] = [Collections.ArrayList] @(,$meta.ref)
+                $container[$name] = [Collections.ArrayList]@($meta.ref)
             } else {
                 $container[$name] = $meta.ref
             }
         } elseif ($existing -is [Collections.ArrayList]) {
             $existing.add($meta.ref) >$null
         } else { # should never happen according to DTD but just in case
-            $container[$name] = [Collections.ArrayList] @($existing, $meta.ref)
+            $container[$name] = [Collections.ArrayList]@($existing, $meta.ref)
         }
 
         if ($entryCallback) {
@@ -769,7 +771,7 @@ function processSeekHead($SeekHead = $segment.SeekHead, [switch]$findAll) {
     }
 
     $savedPos = $stream.position
-    $moreHeads = [Collections.ArrayList] @()
+    $moreHeads = [Collections.ArrayList]::new()
 
     forEach ($seek in $SeekHead.Seek) {
         if ($section = $DTD.Segment._.IDs["0x$(bin2hex $seek.SeekID)"]) {
@@ -1573,8 +1575,8 @@ function init {
     }
 
     # postpone printing these small sections until all contained info is known
-    $script:printPostponed = [regex] '/(Info|Tracks|ChapterAtom|Tag|EditionEntry|CuePoint)/$'
-    $script:printPretty = [regex] (
+    $script:printPostponed = [regex]'/(Info|Tracks|ChapterAtom|Tag|EditionEntry|CuePoint)/$'
+    $script:printPretty = [regex](
         '/Segment/$|' +
         '/Info/(TimecodeScale|SegmentUID)$|' +
         '/Tracks/TrackEntry/(|' +
